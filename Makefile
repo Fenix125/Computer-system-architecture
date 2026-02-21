@@ -1,6 +1,6 @@
 PYTHON ?= .venv/bin/python
 
-.PHONY: run-facade run-logging run-counter run-all
+.PHONY: run-facade run-logging run-counter run-all test-performance
 
 run-facade:
 	$(PYTHON) -m services.facade_service.main
@@ -18,3 +18,6 @@ run-all:
 	$(PYTHON) -m services.facade_service.main & FAC_PID=$$!; \
 	trap 'kill $$LOG_PID $$CNT_PID $$FAC_PID' INT TERM EXIT; \
 	wait
+
+test-performance:
+	uv run pytest -m performance -s tests/performance/test_facade_performance.py
