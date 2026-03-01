@@ -1,5 +1,14 @@
 hazelcast:
   cluster-name: test-hazelcast
+  map:
+    distributed-demo-map:
+      backup-count: 1
+      async-backup-count: 0
+  queue:
+    bounded-consumer-queue:
+      max-size: 10
+    bounded-full-queue:
+      max-size: 10
   network:
     port:
       port: 5701
