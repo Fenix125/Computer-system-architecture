@@ -1,0 +1,47 @@
+services:
+  hazelcast-node-1:
+    image: hazelcast/hazelcast:5.6.0
+    container_name: hazelcast-node-1
+    hostname: hazelcast-node-1
+    environment:
+      HAZELCAST_CONFIG: hazelcast.yml
+    volumes:
+      - ./hazelcast.yml:/opt/hazelcast/hazelcast.yml:ro
+    ports:
+      - "5701:5701"
+
+  hazelcast-node-2:
+    image: hazelcast/hazelcast:5.6.0
+    container_name: hazelcast-node-2
+    hostname: hazelcast-node-2
+    environment:
+      HAZELCAST_CONFIG: hazelcast.yml
+    volumes:
+      - ./hazelcast.yml:/opt/hazelcast/hazelcast.yml:ro
+    ports:
+      - "5702:5701"
+
+  hazelcast-node-3:
+    image: hazelcast/hazelcast:5.6.0
+    container_name: hazelcast-node-3
+    hostname: hazelcast-node-3
+    environment:
+      HAZELCAST_CONFIG: hazelcast.yml
+    volumes:
+      - ./hazelcast.yml:/opt/hazelcast/hazelcast.yml:ro
+    ports:
+      - "5703:5701"
+
+  hazelcast-mc:
+    image: hazelcast/management-center:5.6.0
+    container_name: hazelcast-mc
+    hostname: hazelcast-mc
+    environment:
+      MC_DEFAULT_CLUSTER: test-hazelcast
+      MC_DEFAULT_CLUSTER_MEMBERS: hazelcast-node-1:5701,hazelcast-node-2:5701,hazelcast-node-3:5701
+    depends_on:
+      - hazelcast-node-1
+      - hazelcast-node-2
+      - hazelcast-node-3
+    ports:
+      - "8080:8080"

@@ -1,0 +1,23 @@
+version = 1
+revision = 3
+requires-python = ">=3.12"
+
+[[package]]
+name = "computer-system-architecture"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "hazelcast-python-client" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "hazelcast-python-client", specifier = ">=5.6.0" }]
+
+[[package]]
+name = "hazelcast-python-client"
+version = "5.6.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f8/98/00e665530789906f2bdaff0b49b45e9a277ac883c0ea1726f9472727b42b/hazelcast_python_client-5.6.0.tar.gz", hash = "sha256:834b87076a47c781ef80bdcb522b86abc75ff28992dfe384e47f669f06cabb18", size = 299604, upload-time = "2026-01-16T12:13:04.379Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b9/f1/c06f0b40d5e8f8b7a7373855a0cde9197d511bc717f30a0caf847a34724c/hazelcast_python_client-5.6.0-py3-none-any.whl", hash = "sha256:e2cec409068990ca9b4381fe97160cc2375412334782bef45ab4c8fe4d10536c", size = 508492, upload-time = "2026-01-16T12:13:02.195Z" },
+]
