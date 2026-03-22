@@ -1,3 +1,0 @@
-FACADE_SERVICE_URL=http://localhost:8000
-LOGGING_SERVICE_URL=http://localhost:8001
-COUNTER_SERVICE_URL=http://localhost:8002

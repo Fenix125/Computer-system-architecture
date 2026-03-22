@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -11,6 +12,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request, status
 from pydantic import ValidationError
 
+from services.common.logging_utils import configure_logging
 from services.common.schemas import (
     AccountsResponse,
     BalanceResponse,
@@ -22,7 +24,15 @@ from services.common.schemas import (
     TransactionResult,
     UserSnapshot,
 )
-from services.common.settings import CONFIG, Config, get_bind_host_port
+from services.common.settings import FacadeConfig, get_bind_host_port
+
+
+CONFIG = FacadeConfig.from_env()
+LOGGER = configure_logging("facade-service", instance_name=CONFIG.instance_name)
+
+
+class DownstreamUnavailableError(RuntimeError):
+    """Raised when a downstream service cannot process a request."""
 
 
 @dataclass(slots=True)
@@ -35,7 +45,7 @@ class TimingMetrics:
 
 @dataclass(slots=True)
 class FacadeState:
-    config: Config
+    config: FacadeConfig
     http_client: httpx.AsyncClient
     metrics: TimingMetrics
     metrics_lock: asyncio.Lock
@@ -45,17 +55,24 @@ class FacadeState:
 async def lifespan(app_instance: FastAPI):
     app_instance.state.facade_state = FacadeState(
         config=CONFIG,
-        http_client=httpx.AsyncClient(timeout=5.0),
+        http_client=httpx.AsyncClient(timeout=CONFIG.downstream_timeout_seconds),
         metrics=TimingMetrics(),
         metrics_lock=asyncio.Lock(),
+    )
+    LOGGER.info(
+        "event=service_started logging_instances=%s counter_url=%s",
+        len(CONFIG.logging_service_urls),
+        CONFIG.counter_service_url,
     )
     try:
         yield
     finally:
         await app_instance.state.facade_state.http_client.aclose()
+        LOGGER.info("event=service_stopped")
 
 
 app = FastAPI(title="facade-service", lifespan=lifespan)
+
 
 def get_state(request: Request) -> FacadeState:
     return request.app.state.facade_state
@@ -87,41 +104,44 @@ def build_metrics_response(metrics: TimingMetrics) -> MetricsResponse:
     )
 
 
-async def add_timing_metric(state: FacadeState, service: Literal["logging", "counter"], elapsed_ms: float) -> None:
+async def add_timing_metric(
+    state: FacadeState, service: Literal["logging", "counter"], elapsed_ms: float
+) -> None:
     async with state.metrics_lock:
         if service == "logging":
             state.metrics.logging_service_total_ms += elapsed_ms
             state.metrics.logging_service_calls += 1
             return
+
         state.metrics.counter_service_total_ms += elapsed_ms
         state.metrics.counter_service_calls += 1
 
 
-async def call_service(state: FacadeState, *, service: Literal["logging", "counter"], 
+async def call_service_once(
+    state: FacadeState,
+    *,
+    service: Literal["logging", "counter"],
     method: str,
     url: str,
     json_payload: dict | None = None,
-    ) -> httpx.Response:
-    
+) -> httpx.Response:
     started = perf_counter()
+
     try:
         response = await state.http_client.request(method=method, url=url, json=json_payload)
     except httpx.HTTPError as exc:
         elapsed_ms = (perf_counter() - started) * 1000
         await add_timing_metric(state, service, elapsed_ms)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"{service}-service is unavailable",
-        ) from exc
+        raise DownstreamUnavailableError(f"{service}-service is unavailable") from exc
 
     elapsed_ms = (perf_counter() - started) * 1000
     await add_timing_metric(state, service, elapsed_ms)
 
     if response.status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"{service}-service returned status {response.status_code}",
+        raise DownstreamUnavailableError(
+            f"{service}-service returned status {response.status_code}"
         )
+
     if response.status_code >= status.HTTP_400_BAD_REQUEST:
         detail: str | object = f"{service}-service rejected request"
         try:
@@ -131,7 +151,56 @@ async def call_service(state: FacadeState, *, service: Literal["logging", "count
         except ValueError:
             pass
         raise HTTPException(status_code=response.status_code, detail=detail)
+
     return response
+
+
+async def call_logging_service(
+    state: FacadeState,
+    *,
+    method: str,
+    path: str,
+    json_payload: dict | None = None,
+) -> httpx.Response:
+    candidate_urls = list(state.config.logging_service_urls)
+    random.shuffle(candidate_urls)
+    last_error: DownstreamUnavailableError | None = None
+
+    for attempt, base_url in enumerate(candidate_urls, start=1):
+        url = f"{base_url}{path}"
+        try:
+            response = await call_service_once(
+                state,
+                service="logging",
+                method=method,
+                url=url,
+                json_payload=json_payload,
+            )
+        except DownstreamUnavailableError as exc:
+            last_error = exc
+            LOGGER.warning(
+                "event=logging_instance_retry target=%s attempt=%s method=%s path=%s error=%s",
+                base_url,
+                attempt,
+                method,
+                path,
+                exc,
+            )
+            continue
+
+        LOGGER.info(
+            "event=logging_instance_selected target=%s attempt=%s method=%s path=%s",
+            base_url,
+            attempt,
+            method,
+            path,
+        )
+        return response
+
+    raise HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail="All logging-service instances are unavailable",
+    ) from last_error
 
 
 def build_transaction(payload: TransactionRequest) -> Transaction:
@@ -155,18 +224,24 @@ async def create_transaction(
     transaction = build_transaction(payload)
     transaction_payload = transaction.model_dump(mode="json")
 
-    logging_url = f"{state.config.logging_service_url}/transactions"
+    LOGGER.info(
+        "event=transaction_received transaction_id=%s user_id=%s amount=%s",
+        transaction.transaction_id,
+        transaction.user_id,
+        transaction.amount,
+    )
+
+    logging_path = "/transactions"
     counter_url = f"{state.config.counter_service_url}/transactions"
 
     logging_response, counter_response = await asyncio.gather(
-        call_service(
+        call_logging_service(
             state,
-            service="logging",
             method="POST",
-            url=logging_url,
+            path=logging_path,
             json_payload=transaction_payload,
         ),
-        call_service(
+        call_service_once(
             state,
             service="counter",
             method="POST",
@@ -184,6 +259,13 @@ async def create_transaction(
             detail="Invalid response from downstream service",
         ) from exc
 
+    LOGGER.info(
+        "event=transaction_completed transaction_id=%s user_id=%s balance=%s",
+        transaction.transaction_id,
+        transaction.user_id,
+        counter_data.balance,
+    )
+
     return TransactionResult(
         transaction_id=transaction.transaction_id,
         balance=counter_data.balance,
@@ -193,12 +275,12 @@ async def create_transaction(
 @app.get("/user/{user_id}", response_model=UserSnapshot)
 async def get_user_data(user_id: str, request: Request) -> UserSnapshot:
     state = get_state(request)
-    logging_url = f"{state.config.logging_service_url}/user/{user_id}/transactions"
+    logging_path = f"/user/{user_id}/transactions"
     counter_url = f"{state.config.counter_service_url}/user/{user_id}/balance"
 
     logging_response, counter_response = await asyncio.gather(
-        call_service(state, service="logging", method="GET", url=logging_url),
-        call_service(state, service="counter", method="GET", url=counter_url),
+        call_logging_service(state, method="GET", path=logging_path),
+        call_service_once(state, service="counter", method="GET", url=counter_url),
     )
 
     try:
@@ -212,6 +294,13 @@ async def get_user_data(user_id: str, request: Request) -> UserSnapshot:
             detail="Invalid response from downstream service",
         ) from exc
 
+    LOGGER.info(
+        "event=user_snapshot_returned user_id=%s transaction_count=%s balance=%s",
+        user_id,
+        len(transactions),
+        balance_data.balance,
+    )
+
     return UserSnapshot(
         user_id=user_id,
         balance=balance_data.balance,
@@ -223,17 +312,23 @@ async def get_user_data(user_id: str, request: Request) -> UserSnapshot:
 async def get_all_accounts(request: Request) -> AccountsResponse:
     state = get_state(request)
     counter_url = f"{state.config.counter_service_url}/balances"
-    counter_response = await call_service(
+    counter_response = await call_service_once(
         state, service="counter", method="GET", url=counter_url
     )
 
     try:
-        return AccountsResponse.model_validate(counter_response.json())
+        accounts = AccountsResponse.model_validate(counter_response.json())
     except ValidationError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Invalid response from counter-service",
         ) from exc
+
+    LOGGER.info(
+        "event=accounts_returned account_count=%s",
+        len(accounts.balances),
+    )
+    return accounts
 
 
 @app.get("/metrics", response_model=MetricsResponse)
@@ -248,6 +343,7 @@ async def reset_metrics(request: Request) -> MetricsResponse:
     state = get_state(request)
     async with state.metrics_lock:
         state.metrics = TimingMetrics()
+        LOGGER.info("event=metrics_reset")
         return build_metrics_response(state.metrics)
 
 
