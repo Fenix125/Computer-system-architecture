@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import timezone
 from time import sleep
 
 import hazelcast
 from fastapi import FastAPI, Request, status
+from hazelcast import predicate
 from hazelcast.errors import IllegalStateError
 
 from services.common.logging_utils import configure_logging
@@ -18,6 +20,7 @@ CONFIG = LoggingServiceConfig.from_env()
 LOGGER = configure_logging("logging-service", instance_name=CONFIG.instance_name)
 CONNECT_RETRY_ATTEMPTS = 10
 CONNECT_RETRY_DELAY_SECONDS = 2.0
+USER_INDEX_ENTRY_PREFIX = "__user_tx__:"
 
 
 @dataclass(slots=True)
@@ -25,6 +28,38 @@ class HazelcastStore:
     client: hazelcast.HazelcastClient
     transactions_map: object
     user_index_map: object
+
+    def _encoded_user_id(self, user_id: str) -> str:
+        return user_id.encode("utf-8").hex()
+
+    def _user_transaction_prefix(self, user_id: str) -> str:
+        return f"{USER_INDEX_ENTRY_PREFIX}{self._encoded_user_id(user_id)}:"
+
+    def _user_transaction_key(self, transaction: Transaction) -> str:
+        timestamp = (
+            transaction.timestamp.astimezone(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
+        return (
+            f"{self._user_transaction_prefix(transaction.user_id)}"
+            f"{timestamp}:{transaction.transaction_id}"
+        )
+
+    def _get_user_index_entries(self, user_id: str) -> list[tuple[str, str]]:
+        prefix = self._user_transaction_prefix(user_id)
+        entries = self.user_index_map.entry_set(
+            predicate.like("__key", f"{prefix}%")
+        )
+
+        filtered_entries = [
+            (key, value)
+            for key, value in entries
+            if isinstance(key, str)
+            and key.startswith(prefix)
+            and isinstance(value, str)
+        ]
+        return sorted(filtered_entries, key=lambda item: item[0])
 
     def store_transaction(self, transaction: Transaction) -> bool:
         transaction_payload = transaction.model_dump(mode="json")
@@ -36,19 +71,19 @@ class HazelcastStore:
             is None
         )
 
-        self.user_index_map.lock(transaction.user_id)
-        try:
-            transaction_ids = list(self.user_index_map.get(transaction.user_id) or [])
-            if transaction.transaction_id not in transaction_ids:
-                transaction_ids.append(transaction.transaction_id)
-                self.user_index_map.put(transaction.user_id, transaction_ids)
-        finally:
-            self.user_index_map.unlock(transaction.user_id)
+        self.user_index_map.put_if_absent(
+            self._user_transaction_key(transaction),
+            transaction.transaction_id,
+        )
 
         return stored
 
     def get_user_transactions(self, user_id: str) -> list[Transaction]:
-        transaction_ids = list(self.user_index_map.get(user_id) or [])
+        transaction_ids = [
+            transaction_id
+            for _, transaction_id in self._get_user_index_entries(user_id)
+        ]
+
         if not transaction_ids:
             return []
 
