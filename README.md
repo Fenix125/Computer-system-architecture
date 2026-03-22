@@ -47,7 +47,7 @@ POST `/transactions`
    - one randomly selected logging-service instance
 4. The selected logging-service instance stores the transaction in Hazelcast:
    - `logging-transactions` map: `transaction_id -> transaction payload`
-   - `logging-user-index` map: `user_id -> [transaction_id, ...]`
+   - `logging-user-index` map: `encoded_user_id:timestamp:transaction_id -> transaction_id`
 5. Counter-service updates the account balance in PostgreSQL.
 6. Facade returns `{transaction_id, balance}`.
 
@@ -70,8 +70,9 @@ Hazelcast:
   - key: `transaction_id`
   - value: serialized transaction payload
 - map `logging-user-index`
-  - key: `user_id`
-  - value: ordered list of transaction IDs
+  - stores one append-only index entry per transaction
+  - key format preserves per-user chronological ordering
+  - avoids rewriting shared per-user containers on every write
 
 PostgreSQL:
 
@@ -128,7 +129,9 @@ Makefile
 `services/logging_service/main.py`
 
 - replaces local dictionaries with Hazelcast maps
-- uses Hazelcast map locking on `user_id` while updating the user transaction index
+- stores one per-user index entry per transaction instead of mutating a shared list
+- keeps the POST hot path to two independent `O(1)` Hazelcast writes
+- reads user transactions by querying the Hazelcast index map with a user-specific key prefix
 - logs every received transaction with its instance name
 
 `services/counter_service/main.py`
@@ -297,6 +300,58 @@ The tests use:
 - `GET /user/{user_id}` to measure balances before and after load
 - `POST /transactions` for the write load
 - `GET /metrics` to collect aggregated downstream timings from the facade
+
+### Latest Results
+
+Measured with:
+
+```bash
+FACADE_SERVICE_URL=http://localhost:9000 make test-performance
+```
+
+| Scenario | Total Time | Throughput | Logging Time | Counter Time |
+| --- | ---: | ---: | ---: | ---: |
+| 10 clients x 10k requests to 10 distinct accounts | 282.413 s | 354.09 req/s | 1,632,759.45 ms | 1,578,160.13 ms |
+| 10 clients x 10k requests to the same account | 248.482 s | 402.44 req/s | 1,473,859.79 ms | 1,361,167.96 ms |
+
+### Comparison With Lab 1
+
+| Scenario | Lab 1 Time | Current Time | Lab 1 Throughput | Current Throughput |
+| --- | ---: | ---: | ---: | ---: |
+| 10 clients x 10k requests to 10 distinct accounts | 306.895 s | 282.413 s | 325.84 req/s | 354.09 req/s |
+| 10 clients x 10k requests to the same account | 313.771 s | 248.482 s | 318.70 req/s | 402.44 req/s |
+
+The current Lab 3 version is faster than the earlier Lab 1 measurements on this machine after the logging-service write path was simplified.
+
+### Logging Optimization
+
+The main optimization was in `logging-service`.
+
+Previous Hazelcast design:
+
+- keep the full transaction in `logging-transactions`
+- keep `user_index_map[user_id] = [transaction_id, ...]`
+- every POST had to load that user’s current transaction-id list, append one id, and write the whole list back
+
+Current design:
+
+- `transactions_map[transaction_id] = full transaction`
+- `user_index_map[encoded_user_id:timestamp:transaction_id] = transaction_id`
+
+Why it is faster:
+
+- each POST now does two append-style `put_if_absent` calls
+- there is no per-user lock
+- there is no read-modify-write cycle on a shared per-user list
+- there is no write-time cost that grows with the number of existing transactions for that user
+
+Complexity:
+
+- previous write path: `O(T_u)` where `T_u` is the number of transactions already stored for that user, because the service had to rewrite the user’s full transaction-id list on every POST
+- current write path: `O(1)` per transaction in the logging layer
+- read path for one user: `O(T_u)` where `T_u` is the number of transactions for that user, because the service loads that user’s index entries and then fetches the matching transactions
+
+This tradeoff works well for the provided benchmark because the benchmark is overwhelmingly write-heavy. Faster POST handling matters much more than optimizing a small number of verification GET requests.
 
 ## Important Behavior Notes
 
