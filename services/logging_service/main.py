@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import timezone
 from time import sleep
+from typing import Any
 
 import hazelcast
 from fastapi import FastAPI, Request, status
@@ -23,11 +24,17 @@ CONNECT_RETRY_DELAY_SECONDS = 2.0
 USER_INDEX_ENTRY_PREFIX = "__user_tx__:"
 
 
-@dataclass(slots=True)
 class HazelcastStore:
-    client: hazelcast.HazelcastClient
-    transactions_map: object
-    user_index_map: object
+    def __init__(
+        self,
+        *,
+        client: hazelcast.HazelcastClient,
+        transactions_map: Any,
+        user_index_map: Any,
+    ) -> None:
+        self.client = client
+        self.transactions_map = transactions_map
+        self.user_index_map = user_index_map
 
     def _encoded_user_id(self, user_id: str) -> str:
         return user_id.encode("utf-8").hex()
