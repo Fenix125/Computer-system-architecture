@@ -1,93 +1,113 @@
 # Computer-system-architecture
 
-Lab 3 implementation for the Computer System Architecture course.
+Lab 4 implementation for the Computer System Architecture course.
 
-This version extends the basic banking microservices from Lab 1 with:
+This version extends the previous lab with:
 
-- `3` logging-service instances behind the facade
-- Hazelcast Distributed Map as the shared log storage
-- PostgreSQL as persistent storage for account balances
-- structured service logging via the Python `logging` module
-- Hazelcast Management Center
-- a script that sends the required `10` demo transactions
+- Kafka as the asynchronous message queue from `facade-service` to `counter-service`
+- a dedicated `config-server` that stores the registered service instance addresses
+- explicit transaction statuses: `pending`, `applied`, `rejected`
+- the existing 3-instance `logging-service` setup backed by Hazelcast Distributed Map
+- PostgreSQL as persistent storage for account balances and processed transaction ids
 
 ## Architecture
 
 Services:
 
+- `config-server`
+    - stores registered microservice instances in memory
+    - returns all known instance URLs for a given service name
 - `facade-service`
-  - entrypoint for clients
-  - generates `transaction_id` and UTC `timestamp`
-  - forwards writes to `counter-service` and to one randomly selected `logging-service` instance
-  - retries another logging instance if the selected one is unavailable
-  - measures total call time spent on logging and counter requests
+    - receives client HTTP requests
+    - creates `transaction_id` and UTC `timestamp`
+    - writes every transaction to one randomly selected `logging-service` instance
+    - publishes the counter update to Kafka and returns `202 Accepted`
+    - queries `config-server` before calling `logging-service` or `counter-service`
 - `logging-service-1`, `logging-service-2`, `logging-service-3`
-  - stateless HTTP instances
-  - connect to the Hazelcast cluster through the Hazelcast Python client
-  - store transactions in Hazelcast maps instead of local RAM
-  - emit per-instance logs so it is visible which instance handled which request
+    - register themselves in `config-server`
+    - connect to Hazelcast through the Python client
+    - store transaction records with async processing status fields
 - `counter-service`
-  - stores account balances in PostgreSQL instead of in-memory dictionaries
-  - uses a database transaction plus row-level locking to keep balance updates correct
-- `hazelcast-node-1`, `hazelcast-node-2`, `hazelcast-node-3`
-  - 3-node Hazelcast cluster
-- `hazelcast-mc`
-  - Hazelcast Management Center UI
+    - registers itself in `config-server`
+    - consumes Kafka messages with `aiokafka`
+    - updates balances in PostgreSQL
+    - updates the final transaction status in Hazelcast
+- `kafka`
+    - single-broker Kafka deployment in KRaft mode
 - `postgres`
-  - persistent account storage
+    - persistent account and processed transaction storage
+- `hazelcast-node-1`, `hazelcast-node-2`, `hazelcast-node-3`
+    - Hazelcast cluster for distributed log storage
+- `hazelcast-mc`
+    - Hazelcast Management Center UI
 
 ## Request Flow
 
 POST `/transactions`
 
 1. Client sends `{user_id, amount}` to `facade-service`.
-2. Facade creates `{transaction_id, timestamp, user_id, amount}`.
-3. Facade sends the transaction to:
-   - `counter-service`
-   - one randomly selected logging-service instance
-4. The selected logging-service instance stores the transaction in Hazelcast:
-   - `logging-transactions` map: `transaction_id -> transaction payload`
-   - `logging-user-index` map: `encoded_user_id:timestamp:transaction_id -> transaction_id`
-5. Counter-service updates the account balance in PostgreSQL.
-6. Facade returns `{transaction_id, balance}`.
+2. `facade-service` creates `{transaction_id, timestamp, user_id, amount, status="pending"}`.
+3. `facade-service` asks `config-server` for all `logging-service` instances.
+4. `facade-service` randomly picks one logging instance and stores the pending transaction in Hazelcast through that instance.
+5. `facade-service` publishes the transaction to Kafka for `counter-service`.
+6. `facade-service` returns `202 Accepted` with `{transaction_id, status, queued}`.
+7. `counter-service` consumes the Kafka message and:
+    - applies the balance update in PostgreSQL if valid
+    - or rejects it with `status_reason="insufficient_funds"`
+8. `counter-service` updates the final transaction status in Hazelcast.
 
 GET `/user/{user_id}`
 
-1. Facade randomly selects one logging-service instance and fetches the user transaction list.
-2. Facade fetches the current balance from counter-service.
-3. Facade returns `{user_id, balance, transactions}`.
+1. `facade-service` asks `config-server` for `logging-service` and `counter-service` instance URLs.
+2. It randomly selects a logging instance and fetches all user transactions from Hazelcast.
+3. It fetches the current balance from `counter-service`.
+4. It returns `{user_id, balance, transactions}`.
 
 GET `/accounts`
 
-1. Facade fetches all balances from counter-service.
-2. Facade returns `{balances}`.
+1. `facade-service` asks `config-server` for `counter-service` instances.
+2. It fetches all account balances from `counter-service`.
+3. It returns `{balances}`.
 
 ## Storage Model
 
 Hazelcast:
 
 - map `logging-transactions`
-  - key: `transaction_id`
-  - value: serialized transaction payload
+    - key: `transaction_id`
+    - value: serialized transaction payload with `status` and optional `status_reason`
 - map `logging-user-index`
-  - stores one append-only index entry per transaction
-  - key format preserves per-user chronological ordering
-  - avoids rewriting shared per-user containers on every write
+    - key format preserves per-user chronological ordering
+    - value: `transaction_id`
 
 PostgreSQL:
 
 - table `accounts`
-  - `user_id TEXT PRIMARY KEY`
-  - `balance NUMERIC NOT NULL`
+    - `user_id TEXT PRIMARY KEY`
+    - `balance NUMERIC NOT NULL`
+- table `processed_transactions`
+    - `transaction_id TEXT PRIMARY KEY`
+    - stores the final processing status for idempotent Kafka consumption
+
+Kafka:
+
+- topic `counter-transactions`
+    - written by `facade-service`
+    - consumed by `counter-service`
 
 ## Project Structure
 
 ```text
 services/
   common/
+    discovery.py
     logging_utils.py
     schemas.py
     settings.py
+    transaction_store.py
+  config_server/
+    main.py
+    Dockerfile
   facade_service/
     main.py
     Dockerfile
@@ -100,45 +120,12 @@ services/
 scripts/
   send_test_transactions.py
 tests/
+  unit/
   performance/
-    test_facade_performance.py
 docker-compose.yml
 hazelcast.yml
 Makefile
 ```
-
-## Code Notes
-
-`services/common/settings.py`
-
-- centralizes environment parsing for:
-  - facade routing
-  - Hazelcast connection settings
-  - PostgreSQL connection settings
-
-`services/common/logging_utils.py`
-
-- configures consistent structured log output across all services
-
-`services/facade_service/main.py`
-
-- preserves Lab 1 timing metrics
-- randomizes the order of logging-service URLs for each request
-- retries another logging instance on connection errors or downstream `5xx`
-
-`services/logging_service/main.py`
-
-- replaces local dictionaries with Hazelcast maps
-- stores one per-user index entry per transaction instead of mutating a shared list
-- keeps the POST hot path to two independent `O(1)` Hazelcast writes
-- reads user transactions by querying the Hazelcast index map with a user-specific key prefix
-- logs every received transaction with its instance name
-
-`services/counter_service/main.py`
-
-- initializes the `accounts` table at startup
-- uses PostgreSQL transactions for each balance update
-- inserts a zero-balance row on first use, then locks the row with `SELECT ... FOR UPDATE`
 
 ## Dependencies
 
@@ -153,14 +140,29 @@ Python dependencies are defined in `pyproject.toml`:
 - `httpx`
 - `hazelcast-python-client`
 - `asyncpg`
+- `aiokafka`
 
 ## Environment File
 
-Create a local env file if you want to run services outside Docker:
+Use `.env.example` as the template and keep `.env` as the single editable config file:
 
 ```bash
 cp .env.example .env
 ```
+
+What belongs there:
+
+- host-facing ports such as facade, Kafka, PostgreSQL, and Hazelcast ports
+- shared application settings such as Kafka topic, PostgreSQL credentials, log level, and Hazelcast map names
+- host-side URLs and DSNs derived from those values for local scripts or local `make run-*` commands
+
+What stays in `docker-compose.yml`:
+
+- container-only bind URLs such as `http://0.0.0.0:8000`
+- Docker network service URLs such as `http://config-server:8003`
+- internal container ports such as `8000`, `8001`, `8002`, `8003`, `19092`, and `5701`
+
+The `Makefile` reads `.env` for both `docker compose` commands and local `run-*` targets, so changing `.env` is enough for normal development.
 
 ## Run The Full Stack
 
@@ -170,13 +172,15 @@ Start everything:
 make up
 ```
 
-Services and tools exposed on the host:
+Services and tools exposed on the host by default:
 
 - facade: `http://localhost:9000`
 - logging-service-1: `http://localhost:9001`
 - logging-service-2: `http://localhost:9002`
 - logging-service-3: `http://localhost:9003`
 - counter: `http://localhost:9004`
+- config-server: `http://localhost:9005`
+- Kafka bootstrap server: `localhost:9092`
 - PostgreSQL: `localhost:5432`
 - Hazelcast members: `localhost:5701`, `localhost:5702`, `localhost:5703`
 - Hazelcast Management Center: `http://localhost:8080`
@@ -204,8 +208,10 @@ make logs
 Per-service logs:
 
 ```bash
+make logs-config
 make logs-facade
 make logs-counter
+make logs-kafka
 make logs-logging-1
 make logs-logging-2
 make logs-logging-3
@@ -216,11 +222,11 @@ make logs-hazelcast-3
 make logs-hazelcast-mc
 ```
 
-The `logging-service-*` logs show exactly which instance received each transaction.
+The `logging-service-*` logs still show which instance received each transaction.
 
 ## Demo Script For 10 Transactions
 
-Send the required demo transactions through the facade:
+Here I create the required demo transactions through the facade:
 
 ```bash
 make send-test-transactions
@@ -228,12 +234,11 @@ make send-test-transactions
 
 The script:
 
-- sends `10` POST requests to `facade-service`
-- prints each response with the generated `transaction_id`
-- fetches `/accounts`
-- fetches `/user/{user_id}` for every user used in the script
-
-The default facade URL used by the script is `http://localhost:9000`.
+- sends the 10 demo POST requests to `facade-service`
+- prints the accepted queue responses
+- polls GET endpoints until all tracked transactions are no longer `pending`
+- prints the final `/accounts` snapshot
+- prints `/user/{user_id}` for every affected user
 
 ## Manual API Checks
 
@@ -245,6 +250,7 @@ curl http://localhost:9001/health
 curl http://localhost:9002/health
 curl http://localhost:9003/health
 curl http://localhost:9004/health
+curl http://localhost:9005/health
 ```
 
 Create one transaction:
@@ -255,7 +261,17 @@ curl -X POST http://localhost:9000/transactions \
   -d '{"user_id":"alice","amount":100}'
 ```
 
-Read one user:
+Expected response shape:
+
+```json
+{
+    "transaction_id": "1713431550000000000",
+    "status": "pending",
+    "queued": true
+}
+```
+
+Read one user snapshot:
 
 ```bash
 curl http://localhost:9000/user/alice
@@ -267,96 +283,32 @@ Read all accounts:
 curl http://localhost:9000/accounts
 ```
 
-Read facade metrics:
+Inspect registered service instances:
 
 ```bash
-curl http://localhost:9000/metrics
-curl -X POST http://localhost:9000/metrics/reset
+curl http://localhost:9005/services/logging-service
+curl http://localhost:9005/services/counter-service
+curl http://localhost:9005/services/facade-service
 ```
 
-## Hazelcast Management Center
+## Performance Testing
 
-Open:
-
-- `http://localhost:8080`
-
-The compose file preconfigures Management Center to connect to cluster `bank-hazelcast`.
-
-Useful places to inspect:
-
-- `Storage -> Maps -> logging-transactions`
-- `Storage -> Maps -> logging-user-index`
-
-## Performance Tests
-
-The original performance suite is still available and runs through the facade:
+The performance test:
 
 ```bash
 make test-performance
 ```
 
-The tests use:
+The test:
 
-- `GET /user/{user_id}` to measure balances before and after load
-- `POST /transactions` for the write load
-- `GET /metrics` to collect aggregated downstream timings from the facade
+- measures POST acceptance throughput against `facade-service`
+- records logging HTTP time and Kafka publish time from `/metrics`
+- waits until expected balances appear after asynchronous processing
+- prints the final report for both required scenarios
 
-### Latest Results
+## Notes
 
-Measured with:
-
-```bash
-FACADE_SERVICE_URL=http://localhost:9000 make test-performance
-```
-
-| Scenario | Total Time | Throughput | Logging Time | Counter Time |
-| --- | ---: | ---: | ---: | ---: |
-| 10 clients x 10k requests to 10 distinct accounts | 282.413 s | 354.09 req/s | 1,632,759.45 ms | 1,578,160.13 ms |
-| 10 clients x 10k requests to the same account | 248.482 s | 402.44 req/s | 1,473,859.79 ms | 1,361,167.96 ms |
-
-### Comparison With Lab 1
-
-| Scenario | Lab 1 Time | Current Time | Lab 1 Throughput | Current Throughput |
-| --- | ---: | ---: | ---: | ---: |
-| 10 clients x 10k requests to 10 distinct accounts | 306.895 s | 282.413 s | 325.84 req/s | 354.09 req/s |
-| 10 clients x 10k requests to the same account | 313.771 s | 248.482 s | 318.70 req/s | 402.44 req/s |
-
-The current Lab 3 version is faster than the earlier Lab 1 measurements on this machine after the logging-service write path was simplified.
-
-### Logging Optimization
-
-The main optimization was in `logging-service`.
-
-Previous Hazelcast design:
-
-- keep the full transaction in `logging-transactions`
-- keep `user_index_map[user_id] = [transaction_id, ...]`
-- every POST had to load that user’s current transaction-id list, append one id, and write the whole list back
-
-Current design:
-
-- `transactions_map[transaction_id] = full transaction`
-- `user_index_map[encoded_user_id:timestamp:transaction_id] = transaction_id`
-
-Why it is faster:
-
-- each POST now does two append-style `put_if_absent` calls
-- there is no per-user lock
-- there is no read-modify-write cycle on a shared per-user list
-- there is no write-time cost that grows with the number of existing transactions for that user
-
-Complexity:
-
-- previous write path: `O(T_u)` where `T_u` is the number of transactions already stored for that user, because the service had to rewrite the user’s full transaction-id list on every POST
-- current write path: `O(1)` per transaction in the logging layer
-- read path for one user: `O(T_u)` where `T_u` is the number of transactions for that user, because the service loads that user’s index entries and then fetches the matching transactions
-
-This tradeoff works well for the provided benchmark because the benchmark is overwhelmingly write-heavy. Faster POST handling matters much more than optimizing a small number of verification GET requests.
-
-## Important Behavior Notes
-
-- Logging is shared across all logging-service instances because the data lives in Hazelcast, not in process memory.
-- Counter data survives service restarts because balances are stored in PostgreSQL.
-- Facade timing metrics for logging and counter calls are accumulated independently, so their percentages can overlap when the downstream calls run in parallel.
-- If a selected logging-service instance is down, facade retries another instance automatically.
-- There is no distributed transaction between logging and counter. A counter failure after a successful logging write can still leave the transaction present in the Hazelcast log.
+- POST is now asynchronous for the counter update path, so GET responses can briefly show `pending` transactions.
+- `counter-service` is the only Kafka consumer for transaction updates.
+- `processed_transactions` prevents duplicate Kafka deliveries from applying the same balance update twice.
+- `config-server` is a strict dependency in this implementation. Services must register successfully during startup.

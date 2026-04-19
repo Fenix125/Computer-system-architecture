@@ -1,70 +1,86 @@
+SHELL ?= /bin/sh
 PYTHON ?= .venv/bin/python
+ENV_FILE ?= .env
+COMPOSE ?= docker compose --env-file $(ENV_FILE)
+ENV_RUN = if [ -f "$(ENV_FILE)" ]; then set -a; . "$(ENV_FILE)"; set +a; fi;
 
-.PHONY: run-facade run-logging run-counter \
+.PHONY: run-config run-facade run-logging run-counter \
 	up down restart ps logs \
-	logs-facade logs-counter \
+	logs-config logs-facade logs-counter logs-kafka \
 	logs-logging-1 logs-logging-2 logs-logging-3 \
 	logs-postgres \
 	logs-hazelcast-1 logs-hazelcast-2 logs-hazelcast-3 logs-hazelcast-mc \
-	send-test-transactions test-performance
+	send-test-transactions test-performance test-unit
+
+run-config:
+	@$(ENV_RUN) $(PYTHON) -m services.config_server.main
 
 run-facade:
-	$(PYTHON) -m services.facade_service.main
+	@$(ENV_RUN) $(PYTHON) -m services.facade_service.main
 
 run-logging:
-	LOGGING_INSTANCE_NAME=local-logging-service $(PYTHON) -m services.logging_service.main
+	@$(ENV_RUN) LOGGING_INSTANCE_NAME=local-logging-service $(PYTHON) -m services.logging_service.main
 
 run-counter:
-	$(PYTHON) -m services.counter_service.main
+	@$(ENV_RUN) $(PYTHON) -m services.counter_service.main
 
 up:
-	docker compose up --build
+	$(COMPOSE) up --build
 
 down:
-	docker compose down --remove-orphans
+	$(COMPOSE) down --remove-orphans
 
 restart:
-	docker compose down --remove-orphans
-	docker compose up --build
+	$(COMPOSE) down --remove-orphans
+	$(COMPOSE) up --build
 
 ps:
-	docker compose ps
+	$(COMPOSE) ps
 
 logs:
-	docker compose logs -f --timestamps
+	$(COMPOSE) logs -f --timestamps
+
+logs-config:
+	$(COMPOSE) logs -f --timestamps config-server
 
 logs-facade:
-	docker compose logs -f --timestamps facade-service
+	$(COMPOSE) logs -f --timestamps facade-service
 
 logs-counter:
-	docker compose logs -f --timestamps counter-service
+	$(COMPOSE) logs -f --timestamps counter-service
+
+logs-kafka:
+	$(COMPOSE) logs -f --timestamps kafka
 
 logs-logging-1:
-	docker compose logs -f --timestamps logging-service-1
+	$(COMPOSE) logs -f --timestamps logging-service-1
 
 logs-logging-2:
-	docker compose logs -f --timestamps logging-service-2
+	$(COMPOSE) logs -f --timestamps logging-service-2
 
 logs-logging-3:
-	docker compose logs -f --timestamps logging-service-3
+	$(COMPOSE) logs -f --timestamps logging-service-3
 
 logs-postgres:
-	docker compose logs -f --timestamps postgres
+	$(COMPOSE) logs -f --timestamps postgres
 
 logs-hazelcast-1:
-	docker compose logs -f --timestamps hazelcast-node-1
+	$(COMPOSE) logs -f --timestamps hazelcast-node-1
 
 logs-hazelcast-2:
-	docker compose logs -f --timestamps hazelcast-node-2
+	$(COMPOSE) logs -f --timestamps hazelcast-node-2
 
 logs-hazelcast-3:
-	docker compose logs -f --timestamps hazelcast-node-3
+	$(COMPOSE) logs -f --timestamps hazelcast-node-3
 
 logs-hazelcast-mc:
-	docker compose logs -f --timestamps hazelcast-mc
+	$(COMPOSE) logs -f --timestamps hazelcast-mc
 
 send-test-transactions:
-	$(PYTHON) scripts/send_test_transactions.py
+	@$(ENV_RUN) $(PYTHON) scripts/send_test_transactions.py
 
 test-performance:
-	uv run pytest -m performance -s tests/performance/test_facade_performance.py
+	@$(ENV_RUN) uv run pytest -m performance -s tests/performance/test_facade_performance.py
+
+test-unit:
+	uv run pytest -q tests/unit

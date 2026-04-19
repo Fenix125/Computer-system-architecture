@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -9,9 +10,18 @@ from time import perf_counter, time_ns
 from typing import Literal
 
 import httpx
+from aiokafka import AIOKafkaProducer
 from fastapi import FastAPI, HTTPException, Request, status
 from pydantic import ValidationError
 
+from services.common.discovery import (
+    COUNTER_SERVICE_NAME,
+    FACADE_SERVICE_NAME,
+    LOGGING_SERVICE_NAME,
+    ServiceRegistryError,
+    discover_service_instances,
+    register_service_instance,
+)
 from services.common.logging_utils import configure_logging
 from services.common.schemas import (
     AccountsResponse,
@@ -19,9 +29,10 @@ from services.common.schemas import (
     HealthResponse,
     LogStoreResponse,
     MetricsResponse,
-    Transaction,
+    QueuedTransactionResponse,
+    StoredTransaction,
     TransactionRequest,
-    TransactionResult,
+    TransactionStatusUpdateRequest,
     UserSnapshot,
 )
 from services.common.settings import FacadeConfig, get_bind_host_port
@@ -32,42 +43,68 @@ LOGGER = configure_logging("facade-service", instance_name=CONFIG.instance_name)
 
 
 class DownstreamUnavailableError(RuntimeError):
-    """Raised when a downstream service cannot process a request."""
+    pass
+
+
+class QueueUnavailableError(RuntimeError):
+    pass
 
 
 @dataclass(slots=True)
 class TimingMetrics:
     logging_service_total_ms: float = 0.0
     counter_service_total_ms: float = 0.0
+    kafka_publish_total_ms: float = 0.0
     logging_service_calls: int = 0
     counter_service_calls: int = 0
+    kafka_publish_calls: int = 0
 
 
 @dataclass(slots=True)
 class FacadeState:
     config: FacadeConfig
     http_client: httpx.AsyncClient
+    kafka_producer: AIOKafkaProducer
     metrics: TimingMetrics
     metrics_lock: asyncio.Lock
 
 
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI):
+    http_client = httpx.AsyncClient(timeout=CONFIG.downstream_timeout_seconds)
+    kafka_producer = AIOKafkaProducer(
+        bootstrap_servers=list(CONFIG.kafka.bootstrap_servers),
+        value_serializer=lambda value: json.dumps(value).encode("utf-8"),
+        key_serializer=lambda value: value.encode("utf-8"),
+    )
+    await kafka_producer.start()
+
     app_instance.state.facade_state = FacadeState(
         config=CONFIG,
-        http_client=httpx.AsyncClient(timeout=CONFIG.downstream_timeout_seconds),
+        http_client=http_client,
+        kafka_producer=kafka_producer,
         metrics=TimingMetrics(),
         metrics_lock=asyncio.Lock(),
     )
+    await register_service_instance(
+        service_name=FACADE_SERVICE_NAME,
+        instance_name=CONFIG.instance_name,
+        instance_url=CONFIG.public_url,
+        config_server_url=CONFIG.config_server_url,
+        timeout_seconds=CONFIG.downstream_timeout_seconds,
+        logger=LOGGER,
+    )
     LOGGER.info(
-        "event=service_started logging_instances=%s counter_url=%s",
-        len(CONFIG.logging_service_urls),
-        CONFIG.counter_service_url,
+        "event=service_started public_url=%s config_server=%s kafka_servers=%s",
+        CONFIG.public_url,
+        CONFIG.config_server_url,
+        ",".join(CONFIG.kafka.bootstrap_servers),
     )
     try:
         yield
     finally:
-        await app_instance.state.facade_state.http_client.aclose()
+        await kafka_producer.stop()
+        await http_client.aclose()
         LOGGER.info("event=service_stopped")
 
 
@@ -94,18 +131,28 @@ def build_metrics_response(metrics: TimingMetrics) -> MetricsResponse:
         if metrics.counter_service_calls
         else 0.0
     )
+    kafka_avg = (
+        metrics.kafka_publish_total_ms / metrics.kafka_publish_calls
+        if metrics.kafka_publish_calls
+        else 0.0
+    )
     return MetricsResponse(
         logging_service_total_ms=metrics.logging_service_total_ms,
         counter_service_total_ms=metrics.counter_service_total_ms,
+        kafka_publish_total_ms=metrics.kafka_publish_total_ms,
         logging_service_calls=metrics.logging_service_calls,
         counter_service_calls=metrics.counter_service_calls,
+        kafka_publish_calls=metrics.kafka_publish_calls,
         logging_service_avg_ms=logging_avg,
         counter_service_avg_ms=counter_avg,
+        kafka_publish_avg_ms=kafka_avg,
     )
 
 
 async def add_timing_metric(
-    state: FacadeState, service: Literal["logging", "counter"], elapsed_ms: float
+    state: FacadeState,
+    service: Literal["logging", "counter", "kafka"],
+    elapsed_ms: float,
 ) -> None:
     async with state.metrics_lock:
         if service == "logging":
@@ -113,8 +160,13 @@ async def add_timing_metric(
             state.metrics.logging_service_calls += 1
             return
 
-        state.metrics.counter_service_total_ms += elapsed_ms
-        state.metrics.counter_service_calls += 1
+        if service == "counter":
+            state.metrics.counter_service_total_ms += elapsed_ms
+            state.metrics.counter_service_calls += 1
+            return
+
+        state.metrics.kafka_publish_total_ms += elapsed_ms
+        state.metrics.kafka_publish_calls += 1
 
 
 async def call_service_once(
@@ -155,23 +207,37 @@ async def call_service_once(
     return response
 
 
-async def call_logging_service(
+async def call_registered_service(
     state: FacadeState,
     *,
+    registry_service_name: str,
+    timing_service: Literal["logging", "counter"],
     method: str,
     path: str,
     json_payload: dict | None = None,
 ) -> httpx.Response:
-    candidate_urls = list(state.config.logging_service_urls)
-    random.shuffle(candidate_urls)
+    try:
+        discovered_instances = await discover_service_instances(
+            http_client=state.http_client,
+            config_server_url=state.config.config_server_url,
+            service_name=registry_service_name,
+        )
+    except ServiceRegistryError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+
+    candidate_instances = list(discovered_instances)
+    random.shuffle(candidate_instances)
     last_error: DownstreamUnavailableError | None = None
 
-    for attempt, base_url in enumerate(candidate_urls, start=1):
-        url = f"{base_url}{path}"
+    for attempt, instance in enumerate(candidate_instances, start=1):
+        url = f"{instance.instance_url}{path}"
         try:
             response = await call_service_once(
                 state,
-                service="logging",
+                service=timing_service,
                 method=method,
                 url=url,
                 json_payload=json_payload,
@@ -179,8 +245,9 @@ async def call_logging_service(
         except DownstreamUnavailableError as exc:
             last_error = exc
             LOGGER.warning(
-                "event=logging_instance_retry target=%s attempt=%s method=%s path=%s error=%s",
-                base_url,
+                "event=service_instance_retry registry_service=%s instance_name=%s attempt=%s method=%s path=%s error=%s",
+                registry_service_name,
+                instance.instance_name,
                 attempt,
                 method,
                 path,
@@ -189,8 +256,9 @@ async def call_logging_service(
             continue
 
         LOGGER.info(
-            "event=logging_instance_selected target=%s attempt=%s method=%s path=%s",
-            base_url,
+            "event=service_instance_selected registry_service=%s instance_name=%s attempt=%s method=%s path=%s",
+            registry_service_name,
+            instance.instance_name,
             attempt,
             method,
             path,
@@ -199,28 +267,71 @@ async def call_logging_service(
 
     raise HTTPException(
         status_code=status.HTTP_502_BAD_GATEWAY,
-        detail="All logging-service instances are unavailable",
+        detail=f"All {registry_service_name} instances are unavailable",
     ) from last_error
 
 
-def build_transaction(payload: TransactionRequest) -> Transaction:
-    return Transaction(
+async def publish_counter_event(
+    state: FacadeState,
+    transaction: StoredTransaction,
+) -> None:
+    started = perf_counter()
+
+    try:
+        await state.kafka_producer.send_and_wait(
+            state.config.kafka.counter_topic,
+            key=transaction.user_id,
+            value={
+                "transaction_id": transaction.transaction_id,
+                "timestamp": transaction.timestamp.isoformat(),
+                "user_id": transaction.user_id,
+                "amount": str(transaction.amount),
+            },
+        )
+    except Exception as exc:
+        elapsed_ms = (perf_counter() - started) * 1000
+        await add_timing_metric(state, "kafka", elapsed_ms)
+        raise QueueUnavailableError("counter queue is unavailable") from exc
+
+    elapsed_ms = (perf_counter() - started) * 1000
+    await add_timing_metric(state, "kafka", elapsed_ms)
+
+
+async def mark_transaction_rejected(
+    state: FacadeState,
+    *,
+    transaction_id: str,
+    status_reason: str,
+) -> None:
+    payload = TransactionStatusUpdateRequest(
+        status="rejected",
+        status_reason=status_reason,
+    )
+    await call_registered_service(
+        state,
+        registry_service_name=LOGGING_SERVICE_NAME,
+        timing_service="logging",
+        method="PUT",
+        path=f"/transactions/{transaction_id}/status",
+        json_payload=payload.model_dump(mode="json"),
+    )
+
+
+def build_transaction(payload: TransactionRequest) -> StoredTransaction:
+    return StoredTransaction(
         transaction_id=str(time_ns()),
         timestamp=datetime.now(timezone.utc),
         user_id=payload.user_id,
         amount=payload.amount,
+        status="pending",
+        status_reason=None,
     )
 
 
-@app.post(
-    "/transactions",
-    response_model=TransactionResult,
-    status_code=status.HTTP_201_CREATED,
-)
-async def create_transaction(
-    payload: TransactionRequest, request: Request
-) -> TransactionResult:
-    state = get_state(request)
+async def accept_transaction(
+    state: FacadeState,
+    payload: TransactionRequest,
+) -> QueuedTransactionResponse:
     transaction = build_transaction(payload)
     transaction_payload = transaction.model_dump(mode="json")
 
@@ -231,64 +342,99 @@ async def create_transaction(
         transaction.amount,
     )
 
-    logging_path = "/transactions"
-    counter_url = f"{state.config.counter_service_url}/transactions"
-
-    logging_response, counter_response = await asyncio.gather(
-        call_logging_service(
-            state,
-            method="POST",
-            path=logging_path,
-            json_payload=transaction_payload,
-        ),
-        call_service_once(
-            state,
-            service="counter",
-            method="POST",
-            url=counter_url,
-            json_payload=transaction_payload,
-        ),
+    logging_response = await call_registered_service(
+        state,
+        registry_service_name=LOGGING_SERVICE_NAME,
+        timing_service="logging",
+        method="POST",
+        path="/transactions",
+        json_payload=transaction_payload,
     )
 
     try:
         LogStoreResponse.model_validate(logging_response.json())
-        counter_data = BalanceResponse.model_validate(counter_response.json())
     except ValidationError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Invalid response from downstream service",
+            detail="Invalid response from logging-service",
+        ) from exc
+
+    try:
+        await publish_counter_event(state, transaction)
+    except QueueUnavailableError as exc:
+        try:
+            await mark_transaction_rejected(
+                state,
+                transaction_id=transaction.transaction_id,
+                status_reason="counter_queue_unavailable",
+            )
+        except HTTPException as update_error:
+            LOGGER.warning(
+                "event=transaction_rejection_update_failed transaction_id=%s error=%s",
+                transaction.transaction_id,
+                update_error.detail,
+            )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
         ) from exc
 
     LOGGER.info(
-        "event=transaction_completed transaction_id=%s user_id=%s balance=%s",
+        "event=transaction_queued transaction_id=%s user_id=%s topic=%s",
         transaction.transaction_id,
         transaction.user_id,
-        counter_data.balance,
+        state.config.kafka.counter_topic,
+    )
+    return QueuedTransactionResponse(
+        transaction_id=transaction.transaction_id,
+        status="pending",
+        queued=True,
     )
 
-    return TransactionResult(
-        transaction_id=transaction.transaction_id,
-        balance=counter_data.balance,
-    )
+
+@app.post(
+    "/transactions",
+    response_model=QueuedTransactionResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_transaction(
+    payload: TransactionRequest,
+    request: Request,
+) -> QueuedTransactionResponse:
+    state = get_state(request)
+    return await accept_transaction(state, payload)
 
 
 @app.get("/user/{user_id}", response_model=UserSnapshot)
 async def get_user_data(user_id: str, request: Request) -> UserSnapshot:
     state = get_state(request)
     logging_path = f"/user/{user_id}/transactions"
-    counter_url = f"{state.config.counter_service_url}/user/{user_id}/balance"
+    counter_path = f"/user/{user_id}/balance"
 
     logging_response, counter_response = await asyncio.gather(
-        call_logging_service(state, method="GET", path=logging_path),
-        call_service_once(state, service="counter", method="GET", url=counter_url),
+        call_registered_service(
+            state,
+            registry_service_name=LOGGING_SERVICE_NAME,
+            timing_service="logging",
+            method="GET",
+            path=logging_path,
+        ),
+        call_registered_service(
+            state,
+            registry_service_name=COUNTER_SERVICE_NAME,
+            timing_service="counter",
+            method="GET",
+            path=counter_path,
+        ),
     )
 
     try:
         transactions = [
-            Transaction.model_validate(item) for item in logging_response.json()
+            StoredTransaction.model_validate(item)
+            for item in logging_response.json()
         ]
         balance_data = BalanceResponse.model_validate(counter_response.json())
-    except ValidationError as exc:
+    except (ValidationError, KeyError) as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Invalid response from downstream service",
@@ -300,7 +446,6 @@ async def get_user_data(user_id: str, request: Request) -> UserSnapshot:
         len(transactions),
         balance_data.balance,
     )
-
     return UserSnapshot(
         user_id=user_id,
         balance=balance_data.balance,
@@ -311,9 +456,12 @@ async def get_user_data(user_id: str, request: Request) -> UserSnapshot:
 @app.get("/accounts", response_model=AccountsResponse)
 async def get_all_accounts(request: Request) -> AccountsResponse:
     state = get_state(request)
-    counter_url = f"{state.config.counter_service_url}/balances"
-    counter_response = await call_service_once(
-        state, service="counter", method="GET", url=counter_url
+    counter_response = await call_registered_service(
+        state,
+        registry_service_name=COUNTER_SERVICE_NAME,
+        timing_service="counter",
+        method="GET",
+        path="/balances",
     )
 
     try:
@@ -324,10 +472,7 @@ async def get_all_accounts(request: Request) -> AccountsResponse:
             detail="Invalid response from counter-service",
         ) from exc
 
-    LOGGER.info(
-        "event=accounts_returned account_count=%s",
-        len(accounts.balances),
-    )
+    LOGGER.info("event=accounts_returned account_count=%s", len(accounts.balances))
     return accounts
 
 
@@ -350,5 +495,5 @@ async def reset_metrics(request: Request) -> MetricsResponse:
 if __name__ == "__main__":
     import uvicorn
 
-    host, port = get_bind_host_port(CONFIG.facade_service_url)
+    host, port = get_bind_host_port(CONFIG.bind_url)
     uvicorn.run(app, host=host, port=port)

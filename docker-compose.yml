@@ -1,22 +1,114 @@
+x-app-common-env: &app-common-env
+  LOG_LEVEL: ${LOG_LEVEL}
+
+x-discovery-env: &discovery-env
+  CONFIG_SERVER_URL: http://config-server:8003
+
+x-kafka-client-env: &kafka-client-env
+  KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+  KAFKA_COUNTER_TOPIC: ${KAFKA_COUNTER_TOPIC}
+
+x-hazelcast-client-env: &hazelcast-client-env
+  HAZELCAST_CLUSTER_NAME: ${HAZELCAST_CLUSTER_NAME}
+  HAZELCAST_CLUSTER_CONNECT_TIMEOUT_SECONDS: "${HAZELCAST_CLUSTER_CONNECT_TIMEOUT_SECONDS}"
+  HAZELCAST_TRANSACTIONS_MAP_NAME: ${HAZELCAST_TRANSACTIONS_MAP_NAME}
+  HAZELCAST_USER_INDEX_MAP_NAME: ${HAZELCAST_USER_INDEX_MAP_NAME}
+  HAZELCAST_SMART_ROUTING: "${HAZELCAST_SMART_ROUTING}"
+
+x-logging-service-env: &logging-service-env
+  <<: [*app-common-env, *discovery-env, *hazelcast-client-env]
+  LOGGING_SERVICE_BIND_URL: http://0.0.0.0:8001
+
+x-postgres-env: &postgres-env
+  POSTGRES_DB: ${POSTGRES_DB}
+  POSTGRES_USER: ${POSTGRES_USER}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+x-hazelcast-docker-members: &hazelcast-docker-members hazelcast-node-1:5701,hazelcast-node-2:5701,hazelcast-node-3:5701
+
+x-hazelcast-node: &hazelcast-node
+  image: hazelcast/hazelcast:5.6.0
+  environment:
+    HAZELCAST_CONFIG: hazelcast.yml
+  volumes:
+    - ./hazelcast.yml:/opt/hazelcast/hazelcast.yml:ro
+
 services:
+  config-server:
+    build:
+      context: .
+      dockerfile: services/config_server/Dockerfile
+    container_name: config-server
+    environment:
+      <<: *app-common-env
+      CONFIG_SERVER_BIND_URL: http://0.0.0.0:8003
+      CONFIG_SERVER_PUBLIC_URL: http://config-server:8003
+      CONFIG_SERVER_INSTANCE_NAME: ${CONFIG_SERVER_INSTANCE_NAME}
+    ports:
+      - "${CONFIG_SERVER_HOST_PORT}:8003"
+
+  kafka:
+    image: apache/kafka:4.0.2
+    container_name: kafka
+    hostname: kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:19092,PLAINTEXT_HOST://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,PLAINTEXT_HOST://localhost:${KAFKA_HOST_PORT}
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+    ports:
+      - "${KAFKA_HOST_PORT}:9092"
+
+  kafka-init:
+    image: apache/kafka:4.0.2
+    container_name: kafka-init
+    depends_on:
+      - kafka
+    restart: "no"
+    command:
+      - /bin/bash
+      - -c
+      - |
+        for attempt in {1..30}; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 --create --if-not-exists --topic ${KAFKA_COUNTER_TOPIC} --partitions 3 --replication-factor 1 && exit 0
+          sleep 2
+        done
+        exit 1
+
   facade-service:
     build:
       context: .
       dockerfile: services/facade_service/Dockerfile
     container_name: facade-service
     environment:
-      FACADE_SERVICE_URL: http://0.0.0.0:8000
-      FACADE_INSTANCE_NAME: facade-service
-      LOGGING_SERVICE_URLS: http://logging-service-1:8001,http://logging-service-2:8001,http://logging-service-3:8001
-      COUNTER_SERVICE_URL: http://counter-service:8002
-      DOWNSTREAM_TIMEOUT_SECONDS: "5"
+      <<: [*app-common-env, *discovery-env, *kafka-client-env]
+      FACADE_SERVICE_BIND_URL: http://0.0.0.0:8000
+      FACADE_SERVICE_PUBLIC_URL: http://facade-service:8000
+      FACADE_INSTANCE_NAME: ${FACADE_INSTANCE_NAME}
+      DOWNSTREAM_TIMEOUT_SECONDS: "${DOWNSTREAM_TIMEOUT_SECONDS}"
     depends_on:
-      - logging-service-1
-      - logging-service-2
-      - logging-service-3
-      - counter-service
+      config-server:
+        condition: service_started
+      counter-service:
+        condition: service_started
+      logging-service-1:
+        condition: service_started
+      logging-service-2:
+        condition: service_started
+      logging-service-3:
+        condition: service_started
+      kafka-init:
+        condition: service_completed_successfully
     ports:
-      - "9000:8000"
+      - "${FACADE_HOST_PORT}:8000"
 
   logging-service-1:
     build:
@@ -25,18 +117,17 @@ services:
     container_name: logging-service-1
     restart: unless-stopped
     environment:
-      LOGGING_SERVICE_URL: http://0.0.0.0:8001
+      <<: *logging-service-env
+      LOGGING_SERVICE_PUBLIC_URL: http://logging-service-1:8001
       LOGGING_INSTANCE_NAME: logging-service-1
-      HAZELCAST_CLUSTER_NAME: bank-hazelcast
       HAZELCAST_CLUSTER_MEMBERS: hazelcast-node-1:5701
-      HAZELCAST_CLUSTER_CONNECT_TIMEOUT_SECONDS: "5"
-      HAZELCAST_TRANSACTIONS_MAP_NAME: logging-transactions
-      HAZELCAST_USER_INDEX_MAP_NAME: logging-user-index
-      HAZELCAST_SMART_ROUTING: "false"
     depends_on:
-      - hazelcast-node-1
+      config-server:
+        condition: service_started
+      hazelcast-node-1:
+        condition: service_started
     ports:
-      - "9001:8001"
+      - "${LOGGING_SERVICE_1_HOST_PORT}:8001"
 
   logging-service-2:
     build:
@@ -45,18 +136,17 @@ services:
     container_name: logging-service-2
     restart: unless-stopped
     environment:
-      LOGGING_SERVICE_URL: http://0.0.0.0:8001
+      <<: *logging-service-env
+      LOGGING_SERVICE_PUBLIC_URL: http://logging-service-2:8001
       LOGGING_INSTANCE_NAME: logging-service-2
-      HAZELCAST_CLUSTER_NAME: bank-hazelcast
       HAZELCAST_CLUSTER_MEMBERS: hazelcast-node-2:5701
-      HAZELCAST_CLUSTER_CONNECT_TIMEOUT_SECONDS: "5"
-      HAZELCAST_TRANSACTIONS_MAP_NAME: logging-transactions
-      HAZELCAST_USER_INDEX_MAP_NAME: logging-user-index
-      HAZELCAST_SMART_ROUTING: "false"
     depends_on:
-      - hazelcast-node-2
+      config-server:
+        condition: service_started
+      hazelcast-node-2:
+        condition: service_started
     ports:
-      - "9002:8001"
+      - "${LOGGING_SERVICE_2_HOST_PORT}:8001"
 
   logging-service-3:
     build:
@@ -65,18 +155,17 @@ services:
     container_name: logging-service-3
     restart: unless-stopped
     environment:
-      LOGGING_SERVICE_URL: http://0.0.0.0:8001
+      <<: *logging-service-env
+      LOGGING_SERVICE_PUBLIC_URL: http://logging-service-3:8001
       LOGGING_INSTANCE_NAME: logging-service-3
-      HAZELCAST_CLUSTER_NAME: bank-hazelcast
       HAZELCAST_CLUSTER_MEMBERS: hazelcast-node-3:5701
-      HAZELCAST_CLUSTER_CONNECT_TIMEOUT_SECONDS: "5"
-      HAZELCAST_TRANSACTIONS_MAP_NAME: logging-transactions
-      HAZELCAST_USER_INDEX_MAP_NAME: logging-user-index
-      HAZELCAST_SMART_ROUTING: "false"
     depends_on:
-      - hazelcast-node-3
+      config-server:
+        condition: service_started
+      hazelcast-node-3:
+        condition: service_started
     ports:
-      - "9003:8001"
+      - "${LOGGING_SERVICE_3_HOST_PORT}:8001"
 
   counter-service:
     build:
@@ -84,79 +173,78 @@ services:
       dockerfile: services/counter_service/Dockerfile
     container_name: counter-service
     environment:
-      COUNTER_SERVICE_URL: http://0.0.0.0:8002
-      COUNTER_INSTANCE_NAME: counter-service
-      POSTGRES_DSN: postgresql://postgres:postgres@postgres:5432/banking
-      POSTGRES_CONNECT_TIMEOUT_SECONDS: "10"
+      <<: [*app-common-env, *discovery-env, *hazelcast-client-env, *kafka-client-env]
+      COUNTER_SERVICE_BIND_URL: http://0.0.0.0:8002
+      COUNTER_SERVICE_PUBLIC_URL: http://counter-service:8002
+      COUNTER_INSTANCE_NAME: ${COUNTER_INSTANCE_NAME}
+      POSTGRES_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      POSTGRES_CONNECT_TIMEOUT_SECONDS: "${POSTGRES_CONNECT_TIMEOUT_SECONDS}"
+      HAZELCAST_CLUSTER_MEMBERS: *hazelcast-docker-members
     depends_on:
+      config-server:
+        condition: service_started
+      hazelcast-node-1:
+        condition: service_started
+      hazelcast-node-2:
+        condition: service_started
+      hazelcast-node-3:
+        condition: service_started
+      kafka-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
     ports:
-      - "9004:8002"
+      - "${COUNTER_HOST_PORT}:8002"
 
   postgres:
     image: postgres:16-alpine
     container_name: banking-postgres
     environment:
-      POSTGRES_DB: banking
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      <<: *postgres-env
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d banking"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 20
     ports:
-      - "5432:5432"
+      - "${POSTGRES_HOST_PORT}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
 
   hazelcast-node-1:
-    image: hazelcast/hazelcast:5.6.0
+    <<: *hazelcast-node
     container_name: hazelcast-node-1
     hostname: hazelcast-node-1
-    environment:
-      HAZELCAST_CONFIG: hazelcast.yml
-    volumes:
-      - ./hazelcast.yml:/opt/hazelcast/hazelcast.yml:ro
     ports:
-      - "5701:5701"
+      - "${HAZELCAST_NODE_1_HOST_PORT}:5701"
 
   hazelcast-node-2:
-    image: hazelcast/hazelcast:5.6.0
+    <<: *hazelcast-node
     container_name: hazelcast-node-2
     hostname: hazelcast-node-2
-    environment:
-      HAZELCAST_CONFIG: hazelcast.yml
-    volumes:
-      - ./hazelcast.yml:/opt/hazelcast/hazelcast.yml:ro
     ports:
-      - "5702:5701"
+      - "${HAZELCAST_NODE_2_HOST_PORT}:5701"
 
   hazelcast-node-3:
-    image: hazelcast/hazelcast:5.6.0
+    <<: *hazelcast-node
     container_name: hazelcast-node-3
     hostname: hazelcast-node-3
-    environment:
-      HAZELCAST_CONFIG: hazelcast.yml
-    volumes:
-      - ./hazelcast.yml:/opt/hazelcast/hazelcast.yml:ro
     ports:
-      - "5703:5701"
+      - "${HAZELCAST_NODE_3_HOST_PORT}:5701"
 
   hazelcast-mc:
     image: hazelcast/management-center:5.6.0
     container_name: hazelcast-mc
     hostname: hazelcast-mc
     environment:
-      MC_DEFAULT_CLUSTER: bank-hazelcast
-      MC_DEFAULT_CLUSTER_MEMBERS: hazelcast-node-1:5701,hazelcast-node-2:5701,hazelcast-node-3:5701
+      MC_DEFAULT_CLUSTER: ${HAZELCAST_CLUSTER_NAME}
+      MC_DEFAULT_CLUSTER_MEMBERS: *hazelcast-docker-members
     depends_on:
       - hazelcast-node-1
       - hazelcast-node-2
       - hazelcast-node-3
     ports:
-      - "8080:8080"
+      - "${HAZELCAST_MC_HOST_PORT}:8080"
 
 volumes:
   postgres-data:

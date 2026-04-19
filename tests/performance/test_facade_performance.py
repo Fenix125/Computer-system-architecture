@@ -11,10 +11,14 @@ import httpx
 import pytest
 
 
-FACADE_URL = os.getenv("FACADE_SERVICE_URL", "http://localhost:8000")
+FACADE_URL = os.getenv("FACADE_SERVICE_URL", "http://localhost:9000")
 CLIENTS = int(os.getenv("PERF_CLIENTS", "10"))
 REQUESTS_PER_CLIENT = int(os.getenv("PERF_REQUESTS_PER_CLIENT", "10000"))
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("PERF_REQUEST_TIMEOUT_SECONDS", "10"))
+SETTLE_TIMEOUT_SECONDS = float(os.getenv("PERF_SETTLE_TIMEOUT_SECONDS", "60"))
+SETTLE_POLL_INTERVAL_SECONDS = float(
+    os.getenv("PERF_SETTLE_POLL_INTERVAL_SECONDS", "0.2")
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,9 +31,9 @@ class PerformanceReport:
     total_e2e_s: float
     requests_per_second: float
     logging_total_ms: float
-    counter_total_ms: float
+    kafka_publish_total_ms: float
     logging_share_percent: float
-    counter_share_percent: float
+    kafka_share_percent: float
 
 
 async def _ensure_facade_available(client: httpx.AsyncClient) -> None:
@@ -61,19 +65,47 @@ async def _get_metrics(client: httpx.AsyncClient) -> dict[str, float]:
     payload = response.json()
     return {
         "logging_service_total_ms": float(payload["logging_service_total_ms"]),
-        "counter_service_total_ms": float(payload["counter_service_total_ms"]),
+        "kafka_publish_total_ms": float(payload["kafka_publish_total_ms"]),
     }
 
 
-async def _get_user_balance(client: httpx.AsyncClient, user_id: str) -> Decimal:
+async def _get_user_snapshot(
+    client: httpx.AsyncClient,
+    user_id: str,
+) -> dict[str, object]:
     response = await client.get(f"/user/{user_id}")
     if response.status_code != 200:
         raise AssertionError(
             f"Failed to get user {user_id}: status={response.status_code}, body={response.text}"
         )
+    return response.json()
 
-    payload = response.json()
-    return Decimal(str(payload["balance"]))
+
+async def _wait_for_expected_balance(
+    client: httpx.AsyncClient,
+    *,
+    user_id: str,
+    expected_balance: Decimal,
+) -> None:
+    deadline = perf_counter() + SETTLE_TIMEOUT_SECONDS
+
+    while perf_counter() < deadline:
+        payload = await _get_user_snapshot(client, user_id)
+        actual_balance = Decimal(str(payload["balance"]))
+        if actual_balance == expected_balance:
+            pending_transactions = [
+                item
+                for item in payload["transactions"]
+                if item["status"] == "pending"
+            ]
+            if not pending_transactions:
+                return
+
+        await asyncio.sleep(SETTLE_POLL_INTERVAL_SECONDS)
+
+    raise AssertionError(
+        f"Balance mismatch for {user_id}: expected={expected_balance}, request settlement timed out"
+    )
 
 
 async def _post_transaction(
@@ -86,7 +118,7 @@ async def _post_transaction(
         "/transactions",
         json={"user_id": user_id, "amount": amount},
     )
-    if response.status_code != 201:
+    if response.status_code != 202:
         raise AssertionError(
             "Transaction request failed for "
             f"user={user_id}: status={response.status_code}, body={response.text}"
@@ -151,8 +183,8 @@ def _format_report(report: PerformanceReport) -> str:
         f"throughput: {report.requests_per_second:.2f} req/s\n"
         f"logging-service time: {report.logging_total_ms:.2f} ms "
         f"({report.logging_share_percent:.2f}% of summed E2E time)\n"
-        f"counter-service time: {report.counter_total_ms:.2f} ms "
-        f"({report.counter_share_percent:.2f}% of summed E2E time)\n"
+        f"kafka publish time: {report.kafka_publish_total_ms:.2f} ms "
+        f"({report.kafka_share_percent:.2f}% of summed E2E time)\n"
     )
 
 
@@ -172,10 +204,10 @@ async def _run_scenario(*, scenario_name: str, user_ids: list[str]) -> Performan
         await _ensure_facade_available(client)
 
         unique_users = sorted(set(user_ids))
-        baseline_balances = {
-            user_id: await _get_user_balance(client, user_id=user_id)
-            for user_id in unique_users
-        }
+        baseline_balances = {}
+        for user_id in unique_users:
+            payload = await _get_user_snapshot(client, user_id)
+            baseline_balances[user_id] = Decimal(str(payload["balance"]))
 
         await _reset_metrics(client)
         duration_s, sum_e2e_s = await _run_load(
@@ -188,21 +220,23 @@ async def _run_scenario(*, scenario_name: str, user_ids: list[str]) -> Performan
 
         increments = Counter(user_ids)
         for user_id, appearances in increments.items():
-            final_balance = await _get_user_balance(client, user_id=user_id)
             expected_delta = Decimal(appearances * REQUESTS_PER_CLIENT)
             expected_balance = baseline_balances[user_id] + expected_delta
-            assert final_balance == expected_balance, (
-                f"Balance mismatch for {user_id}: "
-                f"expected={expected_balance}, actual={final_balance}"
+            await _wait_for_expected_balance(
+                client,
+                user_id=user_id,
+                expected_balance=expected_balance,
             )
 
     total_requests = len(user_ids) * REQUESTS_PER_CLIENT
     requests_per_second = total_requests / duration_s if duration_s > 0 else 0.0
     sum_e2e_ms = sum_e2e_s * 1000.0
     logging_total_ms = metrics["logging_service_total_ms"]
-    counter_total_ms = metrics["counter_service_total_ms"]
+    kafka_publish_total_ms = metrics["kafka_publish_total_ms"]
     logging_share_percent = (logging_total_ms / sum_e2e_ms * 100) if sum_e2e_ms else 0.0
-    counter_share_percent = (counter_total_ms / sum_e2e_ms * 100) if sum_e2e_ms else 0.0
+    kafka_share_percent = (
+        (kafka_publish_total_ms / sum_e2e_ms * 100) if sum_e2e_ms else 0.0
+    )
 
     return PerformanceReport(
         scenario=scenario_name,
@@ -213,9 +247,9 @@ async def _run_scenario(*, scenario_name: str, user_ids: list[str]) -> Performan
         total_e2e_s=sum_e2e_s,
         requests_per_second=requests_per_second,
         logging_total_ms=logging_total_ms,
-        counter_total_ms=counter_total_ms,
+        kafka_publish_total_ms=kafka_publish_total_ms,
         logging_share_percent=logging_share_percent,
-        counter_share_percent=counter_share_percent,
+        kafka_share_percent=kafka_share_percent,
     )
 
 
