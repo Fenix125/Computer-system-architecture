@@ -2,24 +2,20 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 
 DEFAULT_FACADE_SERVICE_BIND_URL = "http://0.0.0.0:8000"
-DEFAULT_FACADE_SERVICE_PUBLIC_URL = "http://localhost:8000"
 DEFAULT_LOGGING_SERVICE_BIND_URL = "http://0.0.0.0:8001"
-DEFAULT_LOGGING_SERVICE_PUBLIC_URL = "http://localhost:8001"
 DEFAULT_COUNTER_SERVICE_BIND_URL = "http://0.0.0.0:8002"
-DEFAULT_COUNTER_SERVICE_PUBLIC_URL = "http://localhost:8002"
-DEFAULT_CONFIG_SERVER_BIND_URL = "http://0.0.0.0:8003"
-DEFAULT_CONFIG_SERVER_PUBLIC_URL = "http://localhost:8003"
-DEFAULT_POSTGRES_DSN = "postgresql://postgres:postgres@localhost:5432/banking"
-DEFAULT_CONFIG_SERVER_URL = DEFAULT_CONFIG_SERVER_PUBLIC_URL
+DEFAULT_POSTGRES_DB = "banking"
+DEFAULT_POSTGRES_HOST = "localhost"
+DEFAULT_POSTGRES_PASSWORD = "postgres"
+DEFAULT_POSTGRES_PORT = 5432
+DEFAULT_POSTGRES_USER = "postgres"
 DEFAULT_HAZELCAST_CLUSTER_NAME = "bank-hazelcast"
 DEFAULT_HAZELCAST_CLUSTER_MEMBERS = (
-    "hazelcast-node-1:5701",
-    "hazelcast-node-2:5701",
-    "hazelcast-node-3:5701",
+    "hazelcast:5701",
 )
 DEFAULT_HAZELCAST_TRANSACTIONS_MAP_NAME = "logging-transactions"
 DEFAULT_HAZELCAST_USER_INDEX_MAP_NAME = "logging-user-index"
@@ -28,6 +24,8 @@ DEFAULT_KAFKA_COUNTER_TOPIC = "counter-transactions"
 DEFAULT_DOWNSTREAM_TIMEOUT_SECONDS = 5.0
 DEFAULT_HAZELCAST_CONNECT_TIMEOUT_SECONDS = 5.0
 DEFAULT_POSTGRES_CONNECT_TIMEOUT_SECONDS = 10.0
+DEFAULT_KUBERNETES_NAMESPACE = "default"
+DEFAULT_KUBERNETES_DISCOVERY_CACHE_TTL_SECONDS = 2.0
 
 
 def read_non_empty_str(name: str, default: str) -> str:
@@ -47,6 +45,13 @@ def read_csv(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
 
 def read_positive_float(name: str, default: float) -> float:
     value = float(os.getenv(name, str(default)))
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than zero")
+    return value
+
+
+def read_positive_int(name: str, default: int) -> int:
+    value = int(os.getenv(name, str(default)))
     if value <= 0:
         raise ValueError(f"{name} must be greater than zero")
     return value
@@ -86,28 +91,51 @@ def validate_service_url(
     return service_url.strip()
 
 
-def read_service_url_pair(
-    *,
-    bind_name: str,
-    public_name: str,
-    legacy_name: str | None,
-    default_bind: str,
-    default_public: str,
-) -> tuple[str, str]:
-    legacy_value = os.getenv(legacy_name) if legacy_name else None
-    bind_default = legacy_value or default_bind
-    public_default = legacy_value or default_public
-    bind_url = validate_service_url(
-        bind_name,
-        read_non_empty_str(bind_name, bind_default),
+def read_bind_url(name: str, default: str) -> str:
+    return validate_service_url(
+        name,
+        read_non_empty_str(name, default),
         allow_wildcard_host=True,
     )
-    public_url = validate_service_url(
-        public_name,
-        read_non_empty_str(public_name, public_default),
-        allow_wildcard_host=False,
+
+
+def read_instance_name(name: str, default: str) -> str:
+    return read_non_empty_str(name, os.getenv("HOSTNAME", default))
+
+
+def read_postgres_dsn() -> str:
+    explicit_dsn = os.getenv("POSTGRES_DSN")
+    if explicit_dsn is not None and explicit_dsn.strip():
+        return explicit_dsn.strip()
+
+    host = read_non_empty_str("POSTGRES_HOST", DEFAULT_POSTGRES_HOST)
+    port = read_positive_int("POSTGRES_PORT", DEFAULT_POSTGRES_PORT)
+    database = read_non_empty_str("POSTGRES_DB", DEFAULT_POSTGRES_DB)
+    user = read_non_empty_str("POSTGRES_USER", DEFAULT_POSTGRES_USER)
+    password = read_non_empty_str("POSTGRES_PASSWORD", DEFAULT_POSTGRES_PASSWORD)
+    return (
+        f"postgresql://{quote(user)}:{quote(password)}@"
+        f"{host}:{port}/{quote(database)}"
     )
-    return bind_url, public_url
+
+
+@dataclass(frozen=True, slots=True)
+class KubernetesDiscoveryConfig:
+    namespace: str
+    cache_ttl_seconds: float
+
+    @classmethod
+    def from_env(cls) -> "KubernetesDiscoveryConfig":
+        return cls(
+            namespace=read_non_empty_str(
+                "KUBERNETES_NAMESPACE",
+                DEFAULT_KUBERNETES_NAMESPACE,
+            ),
+            cache_ttl_seconds=read_positive_float(
+                "KUBERNETES_DISCOVERY_CACHE_TTL_SECONDS",
+                DEFAULT_KUBERNETES_DISCOVERY_CACHE_TTL_SECONDS,
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,67 +194,45 @@ class KafkaConfig:
 @dataclass(frozen=True, slots=True)
 class FacadeConfig:
     bind_url: str
-    public_url: str
     instance_name: str
     downstream_timeout_seconds: float
-    config_server_url: str
     kafka: KafkaConfig
+    kubernetes: KubernetesDiscoveryConfig
 
     @classmethod
     def from_env(cls) -> "FacadeConfig":
-        bind_url, public_url = read_service_url_pair(
-            bind_name="FACADE_SERVICE_BIND_URL",
-            public_name="FACADE_SERVICE_PUBLIC_URL",
-            legacy_name="FACADE_SERVICE_URL",
-            default_bind=DEFAULT_FACADE_SERVICE_BIND_URL,
-            default_public=DEFAULT_FACADE_SERVICE_PUBLIC_URL,
-        )
         return cls(
-            bind_url=bind_url,
-            public_url=public_url,
-            instance_name=read_non_empty_str(
+            bind_url=read_bind_url(
+                "FACADE_SERVICE_BIND_URL",
+                DEFAULT_FACADE_SERVICE_BIND_URL,
+            ),
+            instance_name=read_instance_name(
                 "FACADE_INSTANCE_NAME", "facade-service"
             ),
             downstream_timeout_seconds=read_positive_float(
                 "DOWNSTREAM_TIMEOUT_SECONDS",
                 DEFAULT_DOWNSTREAM_TIMEOUT_SECONDS,
             ),
-            config_server_url=validate_service_url(
-                "CONFIG_SERVER_URL",
-                read_non_empty_str("CONFIG_SERVER_URL", DEFAULT_CONFIG_SERVER_URL),
-                allow_wildcard_host=False,
-            ),
             kafka=KafkaConfig.from_env(),
+            kubernetes=KubernetesDiscoveryConfig.from_env(),
         )
 
 
 @dataclass(frozen=True, slots=True)
 class LoggingServiceConfig:
     bind_url: str
-    public_url: str
     instance_name: str
-    config_server_url: str
     hazelcast: HazelcastConfig
 
     @classmethod
     def from_env(cls) -> "LoggingServiceConfig":
-        bind_url, public_url = read_service_url_pair(
-            bind_name="LOGGING_SERVICE_BIND_URL",
-            public_name="LOGGING_SERVICE_PUBLIC_URL",
-            legacy_name="LOGGING_SERVICE_URL",
-            default_bind=DEFAULT_LOGGING_SERVICE_BIND_URL,
-            default_public=DEFAULT_LOGGING_SERVICE_PUBLIC_URL,
-        )
         return cls(
-            bind_url=bind_url,
-            public_url=public_url,
-            instance_name=read_non_empty_str(
-                "LOGGING_INSTANCE_NAME", "logging-service"
+            bind_url=read_bind_url(
+                "LOGGING_SERVICE_BIND_URL",
+                DEFAULT_LOGGING_SERVICE_BIND_URL,
             ),
-            config_server_url=validate_service_url(
-                "CONFIG_SERVER_URL",
-                read_non_empty_str("CONFIG_SERVER_URL", DEFAULT_CONFIG_SERVER_URL),
-                allow_wildcard_host=False,
+            instance_name=read_instance_name(
+                "LOGGING_INSTANCE_NAME", "logging-service"
             ),
             hazelcast=HazelcastConfig.from_env(),
         )
@@ -235,9 +241,7 @@ class LoggingServiceConfig:
 @dataclass(frozen=True, slots=True)
 class CounterServiceConfig:
     bind_url: str
-    public_url: str
     instance_name: str
-    config_server_url: str
     postgres_dsn: str
     postgres_connect_timeout_seconds: float
     hazelcast: HazelcastConfig
@@ -245,55 +249,21 @@ class CounterServiceConfig:
 
     @classmethod
     def from_env(cls) -> "CounterServiceConfig":
-        bind_url, public_url = read_service_url_pair(
-            bind_name="COUNTER_SERVICE_BIND_URL",
-            public_name="COUNTER_SERVICE_PUBLIC_URL",
-            legacy_name="COUNTER_SERVICE_URL",
-            default_bind=DEFAULT_COUNTER_SERVICE_BIND_URL,
-            default_public=DEFAULT_COUNTER_SERVICE_PUBLIC_URL,
-        )
         return cls(
-            bind_url=bind_url,
-            public_url=public_url,
-            instance_name=read_non_empty_str(
+            bind_url=read_bind_url(
+                "COUNTER_SERVICE_BIND_URL",
+                DEFAULT_COUNTER_SERVICE_BIND_URL,
+            ),
+            instance_name=read_instance_name(
                 "COUNTER_INSTANCE_NAME", "counter-service"
             ),
-            config_server_url=validate_service_url(
-                "CONFIG_SERVER_URL",
-                read_non_empty_str("CONFIG_SERVER_URL", DEFAULT_CONFIG_SERVER_URL),
-                allow_wildcard_host=False,
-            ),
-            postgres_dsn=read_non_empty_str("POSTGRES_DSN", DEFAULT_POSTGRES_DSN),
+            postgres_dsn=read_postgres_dsn(),
             postgres_connect_timeout_seconds=read_positive_float(
                 "POSTGRES_CONNECT_TIMEOUT_SECONDS",
                 DEFAULT_POSTGRES_CONNECT_TIMEOUT_SECONDS,
             ),
             hazelcast=HazelcastConfig.from_env(),
             kafka=KafkaConfig.from_env(),
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class ConfigServerConfig:
-    bind_url: str
-    public_url: str
-    instance_name: str
-
-    @classmethod
-    def from_env(cls) -> "ConfigServerConfig":
-        bind_url, public_url = read_service_url_pair(
-            bind_name="CONFIG_SERVER_BIND_URL",
-            public_name="CONFIG_SERVER_PUBLIC_URL",
-            legacy_name=None,
-            default_bind=DEFAULT_CONFIG_SERVER_BIND_URL,
-            default_public=DEFAULT_CONFIG_SERVER_PUBLIC_URL,
-        )
-        return cls(
-            bind_url=bind_url,
-            public_url=public_url,
-            instance_name=read_non_empty_str(
-                "CONFIG_SERVER_INSTANCE_NAME", "config-server"
-            ),
         )
 
 

@@ -16,11 +16,9 @@ from pydantic import ValidationError
 
 from services.common.discovery import (
     COUNTER_SERVICE_NAME,
-    FACADE_SERVICE_NAME,
     LOGGING_SERVICE_NAME,
+    KubernetesServiceDiscovery,
     ServiceRegistryError,
-    discover_service_instances,
-    register_service_instance,
 )
 from services.common.logging_utils import configure_logging
 from services.common.schemas import (
@@ -65,6 +63,7 @@ class FacadeState:
     config: FacadeConfig
     http_client: httpx.AsyncClient
     kafka_producer: AIOKafkaProducer
+    discovery: KubernetesServiceDiscovery
     metrics: TimingMetrics
     metrics_lock: asyncio.Lock
 
@@ -78,31 +77,29 @@ async def lifespan(app_instance: FastAPI):
         key_serializer=lambda value: value.encode("utf-8"),
     )
     await kafka_producer.start()
+    discovery = await KubernetesServiceDiscovery.create(
+        CONFIG.kubernetes,
+        logger=LOGGER,
+    )
 
     app_instance.state.facade_state = FacadeState(
         config=CONFIG,
         http_client=http_client,
         kafka_producer=kafka_producer,
+        discovery=discovery,
         metrics=TimingMetrics(),
         metrics_lock=asyncio.Lock(),
     )
-    await register_service_instance(
-        service_name=FACADE_SERVICE_NAME,
-        instance_name=CONFIG.instance_name,
-        instance_url=CONFIG.public_url,
-        config_server_url=CONFIG.config_server_url,
-        timeout_seconds=CONFIG.downstream_timeout_seconds,
-        logger=LOGGER,
-    )
     LOGGER.info(
-        "event=service_started public_url=%s config_server=%s kafka_servers=%s",
-        CONFIG.public_url,
-        CONFIG.config_server_url,
+        "event=service_started instance_name=%s namespace=%s kafka_servers=%s",
+        CONFIG.instance_name,
+        CONFIG.kubernetes.namespace,
         ",".join(CONFIG.kafka.bootstrap_servers),
     )
     try:
         yield
     finally:
+        await discovery.close()
         await kafka_producer.stop()
         await http_client.aclose()
         LOGGER.info("event=service_stopped")
@@ -217,10 +214,8 @@ async def call_registered_service(
     json_payload: dict | None = None,
 ) -> httpx.Response:
     try:
-        discovered_instances = await discover_service_instances(
-            http_client=state.http_client,
-            config_server_url=state.config.config_server_url,
-            service_name=registry_service_name,
+        discovered_instances = await state.discovery.get_service_instances(
+            registry_service_name,
         )
     except ServiceRegistryError as exc:
         raise HTTPException(
@@ -228,9 +223,59 @@ async def call_registered_service(
             detail=str(exc),
         ) from exc
 
+    response = await call_discovered_instances(
+        state,
+        registry_service_name=registry_service_name,
+        timing_service=timing_service,
+        method=method,
+        path=path,
+        json_payload=json_payload,
+        discovered_instances=discovered_instances,
+    )
+    if response is not None:
+        return response
+
+    try:
+        refreshed_instances = await state.discovery.get_service_instances(
+            registry_service_name,
+            refresh=True,
+        )
+    except ServiceRegistryError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"All {registry_service_name} instances are unavailable",
+        ) from exc
+
+    response = await call_discovered_instances(
+        state,
+        registry_service_name=registry_service_name,
+        timing_service=timing_service,
+        method=method,
+        path=path,
+        json_payload=json_payload,
+        discovered_instances=refreshed_instances,
+    )
+    if response is not None:
+        return response
+
+    raise HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail=f"All {registry_service_name} instances are unavailable",
+    )
+
+
+async def call_discovered_instances(
+    state: FacadeState,
+    *,
+    registry_service_name: str,
+    timing_service: Literal["logging", "counter"],
+    method: str,
+    path: str,
+    json_payload: dict | None,
+    discovered_instances: list,
+) -> httpx.Response | None:
     candidate_instances = list(discovered_instances)
     random.shuffle(candidate_instances)
-    last_error: DownstreamUnavailableError | None = None
 
     for attempt, instance in enumerate(candidate_instances, start=1):
         url = f"{instance.instance_url}{path}"
@@ -243,7 +288,6 @@ async def call_registered_service(
                 json_payload=json_payload,
             )
         except DownstreamUnavailableError as exc:
-            last_error = exc
             LOGGER.warning(
                 "event=service_instance_retry registry_service=%s instance_name=%s attempt=%s method=%s path=%s error=%s",
                 registry_service_name,
@@ -265,10 +309,7 @@ async def call_registered_service(
         )
         return response
 
-    raise HTTPException(
-        status_code=status.HTTP_502_BAD_GATEWAY,
-        detail=f"All {registry_service_name} instances are unavailable",
-    ) from last_error
+    return None
 
 
 async def publish_counter_event(

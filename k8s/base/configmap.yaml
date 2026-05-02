@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: banking-app-config
+  labels:
+    app.kubernetes.io/part-of: banking-lab5
+data:
+  LOG_LEVEL: INFO
+  FACADE_SERVICE_BIND_URL: http://0.0.0.0:8000
+  LOGGING_SERVICE_BIND_URL: http://0.0.0.0:8001
+  COUNTER_SERVICE_BIND_URL: http://0.0.0.0:8002
+  DOWNSTREAM_TIMEOUT_SECONDS: "5"
+  KUBERNETES_DISCOVERY_CACHE_TTL_SECONDS: "2"
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  KAFKA_COUNTER_TOPIC: counter-transactions
+  HAZELCAST_CLUSTER_NAME: bank-hazelcast
+  HAZELCAST_CLUSTER_MEMBERS: hazelcast:5701
+  HAZELCAST_CLUSTER_CONNECT_TIMEOUT_SECONDS: "10"
+  HAZELCAST_TRANSACTIONS_MAP_NAME: logging-transactions
+  HAZELCAST_USER_INDEX_MAP_NAME: logging-user-index
+  HAZELCAST_SMART_ROUTING: "false"
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: banking
+  POSTGRES_USER: postgres
+  POSTGRES_CONNECT_TIMEOUT_SECONDS: "10"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: banking-postgres-secret
+  labels:
+    app.kubernetes.io/part-of: banking-lab5
+type: Opaque
+stringData:
+  POSTGRES_PASSWORD: postgres

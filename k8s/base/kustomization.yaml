@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: banking-lab5
+resources:
+  - namespace.yaml
+  - rbac.yaml
+  - configmap.yaml
+  - postgres.yaml
+  - kafka.yaml
+  - hazelcast.yaml
+  - apps.yaml

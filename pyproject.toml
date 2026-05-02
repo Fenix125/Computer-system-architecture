@@ -10,6 +10,7 @@ dependencies = [
     "fastapi>=0.129.0",
     "hazelcast-python-client>=5.6.0",
     "httpx>=0.28.1",
+    "kubernetes-asyncio>=35.0.1",
     "uvicorn>=0.41.0",
 ]
 

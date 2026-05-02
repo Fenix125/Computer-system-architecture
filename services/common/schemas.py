@@ -85,21 +85,3 @@ class HealthResponse(StrictBaseModel):
 class ServiceInstance(StrictBaseModel):
     instance_name: str = Field(min_length=1)
     instance_url: str = Field(min_length=1)
-
-
-class ServiceRegistrationRequest(StrictBaseModel):
-    service_name: str = Field(min_length=1)
-    instance_name: str = Field(min_length=1)
-    instance_url: str = Field(min_length=1)
-
-
-class ServiceRegistrationResponse(StrictBaseModel):
-    service_name: str
-    instance_name: str
-    instance_url: str
-    registered: bool
-
-
-class ServiceDiscoveryResponse(StrictBaseModel):
-    service_name: str
-    instances: list[ServiceInstance]

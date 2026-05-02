@@ -11,10 +11,7 @@ from aiokafka import AIOKafkaConsumer, TopicPartition
 from fastapi import FastAPI, Request
 from pydantic import ValidationError
 
-from services.common.discovery import (
-    COUNTER_SERVICE_NAME,
-    register_service_instance,
-)
+from services.common.discovery import COUNTER_SERVICE_NAME
 from services.common.logging_utils import configure_logging
 from services.common.schemas import (
     AccountsResponse,
@@ -282,17 +279,9 @@ async def lifespan(app_instance: FastAPI):
     state.consumer_task = asyncio.create_task(consume_counter_events(state))
     app_instance.state.counter_state = state
 
-    await register_service_instance(
-        service_name=COUNTER_SERVICE_NAME,
-        instance_name=CONFIG.instance_name,
-        instance_url=CONFIG.public_url,
-        config_server_url=CONFIG.config_server_url,
-        timeout_seconds=CONFIG.postgres_connect_timeout_seconds,
-        logger=LOGGER,
-    )
     LOGGER.info(
-        "event=service_started storage=postgresql public_url=%s kafka_topic=%s",
-        CONFIG.public_url,
+        "event=service_started instance_name=%s storage=postgresql kafka_topic=%s",
+        CONFIG.instance_name,
         CONFIG.kafka.counter_topic,
     )
     try:

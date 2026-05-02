@@ -6,10 +6,6 @@ from dataclasses import dataclass
 
 from fastapi import FastAPI, HTTPException, Request, status
 
-from services.common.discovery import (
-    LOGGING_SERVICE_NAME,
-    register_service_instance,
-)
 from services.common.logging_utils import configure_logging
 from services.common.schemas import (
     HealthResponse,
@@ -42,20 +38,12 @@ async def lifespan(app_instance: FastAPI):
         client_name=CONFIG.instance_name,
     )
     app_instance.state.logging_state = LoggingState(config=CONFIG, store=store)
-    await register_service_instance(
-        service_name=LOGGING_SERVICE_NAME,
-        instance_name=CONFIG.instance_name,
-        instance_url=CONFIG.public_url,
-        config_server_url=CONFIG.config_server_url,
-        timeout_seconds=CONFIG.hazelcast.cluster_connect_timeout_seconds,
-        logger=LOGGER,
-    )
     LOGGER.info(
-        "event=service_started cluster=%s maps=%s,%s public_url=%s",
+        "event=service_started instance_name=%s cluster=%s maps=%s,%s",
+        CONFIG.instance_name,
         CONFIG.hazelcast.cluster_name,
         CONFIG.hazelcast.transactions_map_name,
         CONFIG.hazelcast.user_index_map_name,
-        CONFIG.public_url,
     )
     try:
         yield
