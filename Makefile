@@ -48,13 +48,13 @@ k8s-forward:
 	kubectl -n $(K8S_NAMESPACE) port-forward svc/facade-service 9000:8000
 
 k8s-logs-facade:
-	kubectl -n $(K8S_NAMESPACE) logs -f deployment/facade-service
+	kubectl -n $(K8S_NAMESPACE) logs -f -l app.kubernetes.io/name=facade-service --all-containers=true --prefix=true
 
 k8s-logs-logging:
-	kubectl -n $(K8S_NAMESPACE) logs -f deployment/logging-service
+	kubectl -n $(K8S_NAMESPACE) logs -f -l app.kubernetes.io/name=logging-service --all-containers=true --prefix=true
 
 k8s-logs-counter:
-	kubectl -n $(K8S_NAMESPACE) logs -f deployment/counter-service
+	kubectl -n $(K8S_NAMESPACE) logs -f -l app.kubernetes.io/name=counter-service --all-containers=true --prefix=true
 
 send-test-transactions:
 	$(PYTHON) scripts/send_test_transactions.py
