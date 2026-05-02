@@ -211,6 +211,29 @@ Run performance tests against a running, port-forwarded facade:
 make test-performance
 ```
 
+## Performance Testing Results
+
+Performance command:
+
+```bash
+uv run pytest -m performance -s tests/performance/test_facade_performance.py
+```
+
+Each scenario sends `100000` total transaction requests: `10` clients with `10000` requests per client. Contribution percentages are calculated against summed client-side request E2E time, not wall-clock total time.
+
+| Test scenario | Task 1 (in-mem)                                        | Task 3 (DB)                                            | Task 5 (final)                                                      |
+| ------------- | ------------------------------------------------------ | ------------------------------------------------------ | ------------------------------------------------------------------- |
+| 10 accounts   | Total time: `306.895 s`                                | Total time: `282.413 s`                                | Total time: `293.384 s`                                             |
+|               | logging-service contribution: `2034999.26 ms (66.41%)` | logging-service contribution: `1632759.45 ms (57.95%)` | logging-service contribution: `1636016.87 ms (57.08%)`              |
+|               | counter-service contribution: `2011310.37 ms (65.63%)` | counter-service contribution: `1578160.13 ms (56.02%)` | counter-service contribution: Kafka publish `376575.92 ms (13.14%)` |
+| 1 account     | Total time: `313.771 s`                                | Total time: `248.482 s`                                | Total time: `290.075 s`                                             |
+|               | logging-service contribution: `2080239.65 ms (66.43%)` | logging-service contribution: `1473859.79 ms (59.51%)` | logging-service contribution: `1788122.09 ms (61.99%)`              |
+|               | counter-service contribution: `2056577.14 ms (65.68%)` | counter-service contribution: `1361167.96 ms (54.96%)` | counter-service contribution: Kafka publish `329420.55 ms (11.42%)` |
+
+Task 5 differs architecturally from Tasks 1 and 3: the facade no longer calls `counter-service` synchronously when accepting a transaction. It stores the transaction in `logging-service`, publishes the counter event to Kafka, and returns `202 Accepted`; `counter-service` settles balances asynchronously from Kafka. For this reason, the Task 5 request-path counter contribution is represented by Kafka publish time, while actual counter processing is verified by settlement checks after the load phase.
+
+The final Kubernetes version is close to Task 3 on the 10-account scenario, but slower for the hot-account scenario. The main expected trade-off is that Task 5 adds Kubernetes service discovery, Kafka publishing, asynchronous settlement, and distributed runtime infrastructure. The benefit is resilience and scalability: service instances are discovered dynamically, failed pods are replaced by Kubernetes, and the counter worker can be scaled or tuned independently from facade request handling.
+
 ## Notes
 
 - `facade-service`, `logging-service`, and `counter-service` no longer call a custom config-server.
