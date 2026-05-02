@@ -87,27 +87,55 @@ class HazelcastTransactionStore:
         status: TransactionStatus,
         status_reason: str | None = None,
     ) -> StoredTransaction:
-        current_transaction = self.get_transaction(transaction_id)
-        if current_transaction is None:
-            raise KeyError(f"Transaction {transaction_id} was not found")
+        return self.update_transaction_statuses(
+            [(transaction_id, status, status_reason)]
+        )[0]
 
-        if (
-            current_transaction.status == status
-            and current_transaction.status_reason == status_reason
-        ):
-            return current_transaction
+    def update_transaction_statuses(
+        self,
+        updates: list[tuple[str, TransactionStatus, str | None]],
+    ) -> list[StoredTransaction]:
+        if not updates:
+            return []
 
-        updated_transaction = current_transaction.model_copy(
-            update={
-                "status": status,
-                "status_reason": status_reason,
-            }
-        )
-        self.transactions_map.put(
-            transaction_id,
-            updated_transaction.model_dump(mode="json"),
-        )
-        return updated_transaction
+        transaction_ids = [transaction_id for transaction_id, _, _ in updates]
+        current_payloads = self.transactions_map.get_all(transaction_ids)
+        changed_payloads: dict[str, object] = {}
+        updated_transactions: list[StoredTransaction] = []
+
+        for transaction_id, status, status_reason in updates:
+            current_payload = current_payloads.get(transaction_id)
+            if current_payload is None:
+                raise KeyError(f"Transaction {transaction_id} was not found")
+
+            current_transaction = StoredTransaction.model_validate(current_payload)
+            if (
+                current_transaction.status == status
+                and current_transaction.status_reason == status_reason
+            ):
+                updated_transactions.append(current_transaction)
+                continue
+
+            updated_transaction = current_transaction.model_copy(
+                update={
+                    "status": status,
+                    "status_reason": status_reason,
+                }
+            )
+            changed_payloads[transaction_id] = updated_transaction.model_dump(
+                mode="json"
+            )
+            updated_transactions.append(updated_transaction)
+
+        if changed_payloads:
+            put_all = getattr(self.transactions_map, "put_all", None)
+            if callable(put_all):
+                put_all(changed_payloads)
+            else:
+                for transaction_id, payload in changed_payloads.items():
+                    self.transactions_map.put(transaction_id, payload)
+
+        return updated_transactions
 
     def get_user_transactions(self, user_id: str) -> list[StoredTransaction]:
         transaction_ids = [

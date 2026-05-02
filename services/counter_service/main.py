@@ -93,81 +93,138 @@ async def process_transaction_in_database(
     pool: asyncpg.Pool,
     transaction: Transaction,
 ) -> TransactionProcessingResult:
+    results = await process_transactions_in_database(pool, [transaction])
+    return results[0]
+
+
+async def process_transactions_in_database(
+    pool: asyncpg.Pool,
+    transactions: list[Transaction],
+) -> list[TransactionProcessingResult]:
+    if not transactions:
+        return []
+
     async with pool.acquire() as connection:
         async with connection.transaction():
-            existing_record = await connection.fetchrow(
+            transaction_ids = [
+                transaction.transaction_id
+                for transaction in transactions
+            ]
+            existing_records = await connection.fetch(
                 """
-                SELECT status, status_reason
+                SELECT transaction_id, status, status_reason
                 FROM processed_transactions
-                WHERE transaction_id = $1
+                WHERE transaction_id = ANY($1::text[])
                 """,
-                transaction.transaction_id,
+                transaction_ids,
             )
-            if existing_record is not None:
-                balance = await connection.fetchval(
-                    "SELECT balance FROM accounts WHERE user_id = $1",
-                    transaction.user_id,
-                )
-                normalized_balance = (
-                    Decimal("0") if balance is None else Decimal(str(balance))
-                )
-                return TransactionProcessingResult(
-                    status=existing_record["status"],
-                    status_reason=existing_record["status_reason"],
-                    balance=normalized_balance,
-                )
+            existing_records_by_id = {
+                record["transaction_id"]: record
+                for record in existing_records
+            }
 
-            await connection.execute(
+            user_ids = sorted({
+                transaction.user_id
+                for transaction in transactions
+            })
+            await connection.executemany(
                 """
                 INSERT INTO accounts (user_id, balance)
                 VALUES ($1, 0)
                 ON CONFLICT (user_id) DO NOTHING
                 """,
-                transaction.user_id,
+                [(user_id,) for user_id in user_ids],
             )
-            row = await connection.fetchrow(
-                "SELECT balance FROM accounts WHERE user_id = $1 FOR UPDATE",
-                transaction.user_id,
-            )
-            current_balance = Decimal(str(row["balance"]))
-            new_balance = current_balance + transaction.amount
-
-            if new_balance < Decimal("0"):
-                status = "rejected"
-                status_reason = "insufficient_funds"
-                final_balance = current_balance
-            else:
-                await connection.execute(
-                    "UPDATE accounts SET balance = $2 WHERE user_id = $1",
-                    transaction.user_id,
-                    new_balance,
-                )
-                status = "applied"
-                status_reason = None
-                final_balance = new_balance
-
-            await connection.execute(
+            account_rows = await connection.fetch(
                 """
-                INSERT INTO processed_transactions (
-                    transaction_id,
-                    user_id,
-                    amount,
-                    status,
-                    status_reason
-                )
-                VALUES ($1, $2, $3, $4, $5)
+                SELECT user_id, balance
+                FROM accounts
+                WHERE user_id = ANY($1::text[])
+                FOR UPDATE
                 """,
-                transaction.transaction_id,
-                transaction.user_id,
-                transaction.amount,
-                status,
-                status_reason,
+                user_ids,
             )
-            return TransactionProcessingResult(
-                status=status,
-                status_reason=status_reason,
-                balance=final_balance,
+            balances = {
+                row["user_id"]: Decimal(str(row["balance"]))
+                for row in account_rows
+            }
+            processed_rows = []
+            processed_results_by_id: dict[str, TransactionProcessingResult] = {}
+            results: list[TransactionProcessingResult] = []
+
+            for transaction in transactions:
+                current_balance = balances[transaction.user_id]
+                existing_record = existing_records_by_id.get(
+                    transaction.transaction_id
+                )
+                if existing_record is not None:
+                    result = TransactionProcessingResult(
+                        status=existing_record["status"],
+                        status_reason=existing_record["status_reason"],
+                        balance=current_balance,
+                    )
+                    results.append(result)
+                    continue
+
+                already_processed_in_batch = processed_results_by_id.get(
+                    transaction.transaction_id
+                )
+                if already_processed_in_batch is not None:
+                    results.append(already_processed_in_batch)
+                    continue
+
+                new_balance = current_balance + transaction.amount
+
+                if new_balance < Decimal("0"):
+                    transaction_status = "rejected"
+                    status_reason = "insufficient_funds"
+                    final_balance = current_balance
+                else:
+                    transaction_status = "applied"
+                    status_reason = None
+                    final_balance = new_balance
+                    balances[transaction.user_id] = new_balance
+
+                result = TransactionProcessingResult(
+                    status=transaction_status,
+                    status_reason=status_reason,
+                    balance=final_balance,
+                )
+                processed_results_by_id[transaction.transaction_id] = result
+                processed_rows.append(
+                    (
+                        transaction.transaction_id,
+                        transaction.user_id,
+                        transaction.amount,
+                        transaction_status,
+                        status_reason,
+                    )
+                )
+                results.append(result)
+
+            await connection.executemany(
+                "UPDATE accounts SET balance = $2 WHERE user_id = $1",
+                [
+                    (user_id, balance)
+                    for user_id, balance in balances.items()
+                ],
             )
+            if processed_rows:
+                await connection.executemany(
+                    """
+                    INSERT INTO processed_transactions (
+                        transaction_id,
+                        user_id,
+                        amount,
+                        status,
+                        status_reason
+                    )
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    processed_rows,
+                )
+
+            return results
 
 
 async def handle_consumed_transaction(
@@ -182,6 +239,25 @@ async def handle_consumed_transaction(
         result.status_reason,
     )
     return result
+
+
+async def handle_consumed_transactions(
+    state: CounterState,
+    transactions: list[Transaction],
+) -> list[TransactionProcessingResult]:
+    results = await process_transactions_in_database(state.pool, transactions)
+    await asyncio.to_thread(
+        state.transaction_store.update_transaction_statuses,
+        [
+            (
+                transaction.transaction_id,
+                result.status,
+                result.status_reason,
+            )
+            for transaction, result in zip(transactions, results, strict=True)
+        ],
+    )
+    return results
 
 
 async def read_balance(pool: asyncpg.Pool, user_id: str) -> Decimal:
@@ -208,44 +284,68 @@ async def read_all_balances(pool: asyncpg.Pool) -> dict[str, Decimal]:
 
 async def consume_counter_events(state: CounterState) -> None:
     try:
-        async for message in state.consumer:
-            try:
-                transaction = Transaction.model_validate(message.value)
-            except ValidationError as exc:
-                LOGGER.error(
-                    "event=counter_message_invalid topic=%s partition=%s offset=%s error=%s",
-                    message.topic,
-                    message.partition,
-                    message.offset,
-                    exc,
-                )
+        while True:
+            messages_by_partition = await state.consumer.getmany(
+                timeout_ms=state.config.consumer_poll_timeout_ms,
+                max_records=state.config.consumer_batch_size,
+            )
+            messages = [
+                message
+                for partition_messages in messages_by_partition.values()
+                for message in partition_messages
+            ]
+            if not messages:
+                continue
+
+            transactions: list[Transaction] = []
+            retry_offsets: dict[TopicPartition, int] = {}
+
+            for message in messages:
+                try:
+                    transaction = Transaction.model_validate(message.value)
+                except ValidationError as exc:
+                    LOGGER.error(
+                        "event=counter_message_invalid topic=%s partition=%s offset=%s error=%s",
+                        message.topic,
+                        message.partition,
+                        message.offset,
+                        exc,
+                    )
+                    continue
+
+                transactions.append(transaction)
+                topic_partition = TopicPartition(message.topic, message.partition)
+                retry_offsets.setdefault(topic_partition, message.offset)
+
+            if not transactions:
                 await state.consumer.commit()
                 continue
 
             try:
-                result = await handle_consumed_transaction(state, transaction)
+                results = await handle_consumed_transactions(state, transactions)
             except Exception as exc:
-                topic_partition = TopicPartition(message.topic, message.partition)
-                state.consumer.seek(topic_partition, message.offset)
+                for topic_partition, offset in retry_offsets.items():
+                    state.consumer.seek(topic_partition, offset)
                 LOGGER.warning(
-                    "event=counter_message_retry transaction_id=%s partition=%s offset=%s error=%s",
-                    transaction.transaction_id,
-                    message.partition,
-                    message.offset,
+                    "event=counter_batch_retry message_count=%s partition_count=%s error=%s",
+                    len(transactions),
+                    len(retry_offsets),
                     exc,
                 )
                 await asyncio.sleep(CONSUMER_RETRY_DELAY_SECONDS)
                 continue
 
             await state.consumer.commit()
+
+            applied_count = sum(1 for result in results if result.status == "applied")
+            rejected_count = sum(1 for result in results if result.status == "rejected")
             LOGGER.info(
-                "event=transaction_processed transaction_id=%s user_id=%s amount=%s status=%s status_reason=%s balance=%s",
-                transaction.transaction_id,
-                transaction.user_id,
-                transaction.amount,
-                result.status,
-                result.status_reason,
-                result.balance,
+                "event=transactions_processed batch_size=%s applied=%s rejected=%s first_transaction_id=%s last_transaction_id=%s",
+                len(transactions),
+                applied_count,
+                rejected_count,
+                transactions[0].transaction_id,
+                transactions[-1].transaction_id,
             )
     except asyncio.CancelledError:
         raise
@@ -265,6 +365,7 @@ async def lifespan(app_instance: FastAPI):
         group_id=COUNTER_SERVICE_NAME,
         enable_auto_commit=False,
         auto_offset_reset="earliest",
+        max_poll_records=CONFIG.consumer_batch_size,
         value_deserializer=lambda payload: json.loads(payload.decode("utf-8")),
     )
     await consumer.start()

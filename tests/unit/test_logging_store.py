@@ -21,6 +21,9 @@ class FakeMap:
     def put(self, key: str, value: object) -> None:
         self.items[key] = value
 
+    def put_all(self, values: dict[str, object]) -> None:
+        self.items.update(values)
+
     def get(self, key: str) -> object | None:
         return self.items.get(key)
 
@@ -87,3 +90,36 @@ def test_logging_store_preserves_order_and_status_updates() -> None:
     assert updated_transaction.status == "applied"
     assert [item.transaction_id for item in user_transactions] == ["tx-1", "tx-2"]
     assert user_transactions[1].status == "applied"
+
+
+def test_logging_store_updates_transaction_statuses_in_batch() -> None:
+    store = HazelcastTransactionStore(
+        client=object(),
+        transactions_map=FakeMap(),
+        user_index_map=FakeMap(),
+    )
+    first_transaction = build_transaction(
+        transaction_id="tx-1",
+        user_id="alice",
+        amount="100",
+        seconds_offset=0,
+    )
+    second_transaction = build_transaction(
+        transaction_id="tx-2",
+        user_id="alice",
+        amount="-25",
+        seconds_offset=5,
+    )
+
+    store.store_transaction(first_transaction)
+    store.store_transaction(second_transaction)
+    updated_transactions = store.update_transaction_statuses(
+        [
+            ("tx-1", "applied", None),
+            ("tx-2", "rejected", "insufficient_funds"),
+        ]
+    )
+
+    assert [item.status for item in updated_transactions] == ["applied", "rejected"]
+    assert store.get_transaction("tx-1").status == "applied"
+    assert store.get_transaction("tx-2").status == "rejected"

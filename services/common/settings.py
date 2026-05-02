@@ -26,6 +26,8 @@ DEFAULT_HAZELCAST_CONNECT_TIMEOUT_SECONDS = 5.0
 DEFAULT_POSTGRES_CONNECT_TIMEOUT_SECONDS = 10.0
 DEFAULT_KUBERNETES_NAMESPACE = "default"
 DEFAULT_KUBERNETES_DISCOVERY_CACHE_TTL_SECONDS = 2.0
+DEFAULT_COUNTER_CONSUMER_BATCH_SIZE = 1000
+DEFAULT_COUNTER_CONSUMER_POLL_TIMEOUT_MS = 500
 
 
 def read_non_empty_str(name: str, default: str) -> str:
@@ -244,6 +246,8 @@ class CounterServiceConfig:
     instance_name: str
     postgres_dsn: str
     postgres_connect_timeout_seconds: float
+    consumer_batch_size: int
+    consumer_poll_timeout_ms: int
     hazelcast: HazelcastConfig
     kafka: KafkaConfig
 
@@ -261,6 +265,14 @@ class CounterServiceConfig:
             postgres_connect_timeout_seconds=read_positive_float(
                 "POSTGRES_CONNECT_TIMEOUT_SECONDS",
                 DEFAULT_POSTGRES_CONNECT_TIMEOUT_SECONDS,
+            ),
+            consumer_batch_size=read_positive_int(
+                "COUNTER_CONSUMER_BATCH_SIZE",
+                DEFAULT_COUNTER_CONSUMER_BATCH_SIZE,
+            ),
+            consumer_poll_timeout_ms=read_positive_int(
+                "COUNTER_CONSUMER_POLL_TIMEOUT_MS",
+                DEFAULT_COUNTER_CONSUMER_POLL_TIMEOUT_MS,
             ),
             hazelcast=HazelcastConfig.from_env(),
             kafka=KafkaConfig.from_env(),

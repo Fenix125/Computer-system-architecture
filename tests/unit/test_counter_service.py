@@ -12,7 +12,9 @@ from services.common.schemas import Transaction
 from services.counter_service.main import (
     TransactionProcessingResult,
     handle_consumed_transaction,
+    handle_consumed_transactions,
     process_transaction_in_database,
+    process_transactions_in_database,
 )
 
 
@@ -65,6 +67,50 @@ class FakeConnection:
 
         raise AssertionError(f"Unexpected query: {query}")
 
+    async def fetch(self, query: str, *args):
+        if "FROM processed_transactions" in query:
+            transaction_ids = args[0]
+            return [
+                {
+                    "transaction_id": transaction_id,
+                    **self.processed_transactions[transaction_id],
+                }
+                for transaction_id in transaction_ids
+                if transaction_id in self.processed_transactions
+            ]
+
+        if "FROM accounts" in query and "FOR UPDATE" in query:
+            return [
+                {
+                    "user_id": user_id,
+                    "balance": self.balances[user_id],
+                }
+                for user_id in args[0]
+            ]
+
+        raise AssertionError(f"Unexpected query: {query}")
+
+    async def executemany(self, query: str, args_list) -> None:
+        if "INSERT INTO accounts" in query:
+            for (user_id,) in args_list:
+                self.balances.setdefault(user_id, Decimal("0"))
+            return
+
+        if "UPDATE accounts SET balance" in query:
+            for user_id, balance in args_list:
+                self.balances[user_id] = Decimal(str(balance))
+            return
+
+        if "INSERT INTO processed_transactions" in query:
+            for transaction_id, _user_id, _amount, status, status_reason in args_list:
+                self.processed_transactions[transaction_id] = {
+                    "status": status,
+                    "status_reason": status_reason,
+                }
+            return
+
+        raise AssertionError(f"Unexpected query: {query}")
+
 
 class FakeAcquireContext:
     def __init__(self, connection: FakeConnection) -> None:
@@ -96,6 +142,12 @@ class FakeStore:
         status_reason: str | None,
     ) -> None:
         self.status_updates.append((transaction_id, status, status_reason))
+
+    def update_transaction_statuses(
+        self,
+        updates: list[tuple[str, str, str | None]],
+    ) -> None:
+        self.status_updates.extend(updates)
 
 
 def build_transaction(*, transaction_id: str, user_id: str, amount: str) -> Transaction:
@@ -159,6 +211,29 @@ def test_process_transaction_in_database_is_idempotent_for_duplicate_messages() 
     assert len(connection.processed_transactions) == 1
 
 
+def test_process_transactions_in_database_batches_multiple_accounts() -> None:
+    connection = FakeConnection()
+    pool = FakePool(connection)
+    transactions = [
+        build_transaction(transaction_id="tx-4", user_id="alice", amount="10"),
+        build_transaction(transaction_id="tx-5", user_id="alice", amount="-3"),
+        build_transaction(transaction_id="tx-6", user_id="bob", amount="-1"),
+        build_transaction(transaction_id="tx-7", user_id="bob", amount="5"),
+    ]
+
+    results = asyncio.run(process_transactions_in_database(pool, transactions))
+
+    assert [result.status for result in results] == [
+        "applied",
+        "applied",
+        "rejected",
+        "applied",
+    ]
+    assert connection.balances["alice"] == Decimal("7")
+    assert connection.balances["bob"] == Decimal("5")
+    assert len(connection.processed_transactions) == 4
+
+
 def test_handle_consumed_transaction_updates_transaction_status_store(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -187,4 +262,42 @@ def test_handle_consumed_transaction_updates_transaction_status_store(
     assert result.status == "rejected"
     assert fake_store.status_updates == [
         ("tx-4", "rejected", "insufficient_funds")
+    ]
+
+
+def test_handle_consumed_transactions_updates_transaction_statuses_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_process_transactions_in_database(pool, transactions):
+        return [
+            TransactionProcessingResult(
+                status="applied",
+                status_reason=None,
+                balance=Decimal("10"),
+            ),
+            TransactionProcessingResult(
+                status="rejected",
+                status_reason="insufficient_funds",
+                balance=Decimal("10"),
+            ),
+        ]
+
+    fake_store = FakeStore(status_updates=[])
+    state = SimpleNamespace(pool=object(), transaction_store=fake_store)
+    transactions = [
+        build_transaction(transaction_id="tx-8", user_id="alice", amount="10"),
+        build_transaction(transaction_id="tx-9", user_id="alice", amount="-20"),
+    ]
+
+    monkeypatch.setattr(
+        "services.counter_service.main.process_transactions_in_database",
+        fake_process_transactions_in_database,
+    )
+
+    results = asyncio.run(handle_consumed_transactions(state, transactions))
+
+    assert [result.status for result in results] == ["applied", "rejected"]
+    assert fake_store.status_updates == [
+        ("tx-8", "applied", None),
+        ("tx-9", "rejected", "insufficient_funds"),
     ]
