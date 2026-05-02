@@ -8,12 +8,13 @@ export
 endif
 
 K8S_NAMESPACE ?= banking-lab5
+K8S_NODE ?= desktop-control-plane
 K8S_BASE ?= k8s/base
 FACADE_IMAGE ?= computer-system-architecture-facade:lab5
 LOGGING_IMAGE ?= computer-system-architecture-logging:lab5
 COUNTER_IMAGE ?= computer-system-architecture-counter:lab5
 
-.PHONY: k8s-build k8s-up k8s-down k8s-status k8s-forward \
+.PHONY: k8s-build k8s-load-images k8s-up k8s-down k8s-status k8s-forward \
 	k8s-logs-facade k8s-logs-logging k8s-logs-counter \
 	send-test-transactions test-performance test-unit
 
@@ -22,7 +23,12 @@ k8s-build:
 	docker build -f services/logging_service/Dockerfile -t $(LOGGING_IMAGE) .
 	docker build -f services/counter_service/Dockerfile -t $(COUNTER_IMAGE) .
 
-k8s-up:
+k8s-load-images:
+	docker save $(FACADE_IMAGE) | docker exec -i $(K8S_NODE) ctr -n k8s.io images import -
+	docker save $(LOGGING_IMAGE) | docker exec -i $(K8S_NODE) ctr -n k8s.io images import -
+	docker save $(COUNTER_IMAGE) | docker exec -i $(K8S_NODE) ctr -n k8s.io images import -
+
+k8s-up: k8s-build k8s-load-images
 	kubectl apply -k $(K8S_BASE)
 	kubectl -n $(K8S_NAMESPACE) rollout status statefulset/postgres --timeout=180s
 	kubectl -n $(K8S_NAMESPACE) rollout status statefulset/kafka --timeout=180s

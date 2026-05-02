@@ -110,10 +110,11 @@ kubectl config use-context docker-desktop
 
 ## Run The Kubernetes Stack
 
-Build local service images:
+Build local service images and import them into the Docker Desktop Kubernetes node:
 
 ```bash
 make k8s-build
+make k8s-load-images
 ```
 
 Deploy the namespace, infrastructure pods, app pods, ConfigMap, Secret, and RBAC:
@@ -121,6 +122,8 @@ Deploy the namespace, infrastructure pods, app pods, ConfigMap, Secret, and RBAC
 ```bash
 make k8s-up
 ```
+
+`make k8s-up` also runs `k8s-build` and `k8s-load-images` before applying manifests. Docker Desktop Kubernetes uses its own node containerd image store, so the image import step is required when manifests use `imagePullPolicy: Never`.
 
 Expose the facade locally:
 
@@ -193,15 +196,6 @@ kubectl -n banking-lab5 delete pod <one-logging-pod-name>
 ```
 
 Kubernetes marks the deleted pod as terminating and creates a replacement. During this, `facade-service` refreshes discovery and redirects calls to other Ready logging pods.
-
-For counter failover, first scale the counter deployment:
-
-```bash
-kubectl -n banking-lab5 scale deployment/counter-service --replicas=2
-kubectl -n banking-lab5 rollout status deployment/counter-service
-kubectl -n banking-lab5 get pod -l app.kubernetes.io/name=counter-service
-kubectl -n banking-lab5 delete pod <one-counter-pod-name>
-```
 
 ## Testing
 
