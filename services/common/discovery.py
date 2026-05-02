@@ -124,7 +124,7 @@ class KubernetesServiceDiscovery:
         instances = [
             instance
             for pod in pod_list.items
-            if (instance := pod_to_service_instance(pod, service_name)) is not None
+            if (instance := pod_to_service_instance(pod)) is not None
         ]
         random.shuffle(instances)
 
@@ -138,7 +138,6 @@ class KubernetesServiceDiscovery:
 
 def pod_to_service_instance(
     pod: Any,
-    service_name: str,
     *,
     port_name: str = DEFAULT_HTTP_PORT_NAME,
 ) -> ServiceInstance | None:

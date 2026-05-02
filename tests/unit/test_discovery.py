@@ -78,27 +78,23 @@ def build_discovery(pods: list[SimpleNamespace]) -> KubernetesServiceDiscovery:
 
 def test_pod_to_service_instance_requires_ready_pod_ip_and_http_port() -> None:
     valid_instance = pod_to_service_instance(
-        build_pod(name="logging-service-1", pod_ip="10.1.2.3", ready=True),
-        "logging-service",
-    )
+        build_pod(name="logging-service-1", pod_ip="10.1.2.3", ready=True))
 
     assert valid_instance is not None
     assert valid_instance.instance_name == "logging-service-1"
     assert valid_instance.instance_url == "http://10.1.2.3:8001"
 
-    assert pod_to_service_instance(build_pod(pod_ip=None), "logging-service") is None
-    assert pod_to_service_instance(build_pod(ready=False), "logging-service") is None
+    assert pod_to_service_instance(build_pod(pod_ip=None)) is None
+    assert pod_to_service_instance(build_pod(ready=False)) is None
     assert (
         pod_to_service_instance(
             build_pod(deletion_timestamp=object()),
-            "logging-service",
         )
         is None
     )
     assert (
         pod_to_service_instance(
             build_pod(port_name="metrics"),
-            "logging-service",
         )
         is None
     )
