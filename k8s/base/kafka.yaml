@@ -22,6 +22,7 @@ metadata:
     app.kubernetes.io/part-of: banking-lab5
 spec:
   clusterIP: None
+  publishNotReadyAddresses: true
   ports:
     - name: client
       port: 9092
@@ -88,12 +89,12 @@ spec:
           readinessProbe:
             tcpSocket:
               port: client
-            initialDelaySeconds: 10
+            initialDelaySeconds: 20
             periodSeconds: 5
           livenessProbe:
             tcpSocket:
               port: client
-            initialDelaySeconds: 30
+            initialDelaySeconds: 90
             periodSeconds: 10
 ---
 apiVersion: batch/v1
